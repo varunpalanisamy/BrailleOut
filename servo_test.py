@@ -243,7 +243,7 @@ class ServoTestApp(tk.Tk):
             self._sub_var.set("Wait for startup check to finish…")
             return
         now = time.time()
-        if now - self._last_key_time < 0.15:
+        if now - self._last_key_time < 0.8:   # block until previous up+down cycle finishes
             return
         self._last_key_time = now
 
@@ -252,21 +252,34 @@ class ServoTestApp(tk.Tk):
         except ValueError:
             return
 
-        pattern = make_pattern(n)
-
         if n == 0:
             self._render([])
             self._status_var.set("ALL DOWN — reset")
             self._sub_var.set("")
-            self._pattern_var.set(f"serial → \"{pattern}\"")
-        else:
-            self._render([n])
-            self._status_var.set(f"Servo {n}  ({SERVO_POSITIONS[n]})  →  UP")
-            self._sub_var.set("All other servos are DOWN.")
-            self._pattern_var.set(f"serial → \"{pattern}\"")
+            self._pattern_var.set(f"serial → \"000000\"")
+            send_pattern("000000", self.ser)
+            return
 
-        print(f"[Test] Servo {n}  pattern={pattern}")
+        pattern = make_pattern(n)
+
+        # Show UP state
+        self._render([n])
+        self._status_var.set(f"Servo {n}  ({SERVO_POSITIONS[n]})  →  UP")
+        self._sub_var.set("Holding 0.5s…")
+        self._pattern_var.set(f"serial → \"{pattern}\"")
+        print(f"[Test] Servo {n} UP  pattern={pattern}")
         send_pattern(pattern, self.ser)
+
+        # After 500ms: go back down automatically
+        self.after(500, lambda: self._bring_down(n))
+
+    def _bring_down(self, n: int) -> None:
+        self._render([])
+        self._status_var.set(f"Servo {n}  →  DOWN")
+        self._sub_var.set("Ready for next key.")
+        self._pattern_var.set("serial → \"000000\"")
+        print(f"[Test] Servo {n} DOWN")
+        send_pattern("000000", self.ser)
 
     # ── Quit ────────────────────────────────────────────────────
 
@@ -293,4 +306,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
