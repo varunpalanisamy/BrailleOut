@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-servo_test.py — Individual servo tester
-========================================
-Press 1–6  →  only that one servo moves up, all others go down.
-Press 0    →  all servos go down (full reset).
-Press ESC  →  quit.
+servo_test.py — Individual servo tester with startup health check
+=================================================================
+On launch:
+  1. Arduino moves ALL 6 servos UP together (blue on screen)
+  2. Arduino moves ALL 6 servos DOWN together
+  3. Arduino moves each servo UP and DOWN one by one (green on screen)
+  4. Screen unlocks — press 1–6 to test each servo individually
 
-Servo positions in the Braille cell:
-    [1] [2]
-    [3] [4]
-    [5] [6]
+Press 1–6  →  only that one servo moves up, all others go down
+Press 0    →  all servos go down (full reset)
+Press ESC  →  quit (all servos return to rest)
 
-Use this to confirm each servo is wired to the correct physical position.
+Servo positions:
+    [1] [2]   ← top row
+    [3] [4]   ← middle row
+    [5] [6]   ← bottom row
 """
 
 import time
@@ -27,9 +31,6 @@ except ImportError:
 SERIAL_PORT = "/dev/cu.usbmodem1051DB2BD6802"
 SERIAL_BAUD = 9600
 
-# Dot layout as the user labeled them (left→right, top→bottom)
-# Position in pattern string = servo index (0-based)
-# Servo 1 → index 0, Servo 2 → index 1, ... Servo 6 → index 5
 SERVO_POSITIONS = {
     1: "top-left",
     2: "top-right",
@@ -39,14 +40,10 @@ SERVO_POSITIONS = {
     6: "bot-right",
 }
 
-# Grid coords for drawing (row, col)
 SERVO_GRID = {
-    1: (0, 0),
-    2: (0, 1),
-    3: (1, 0),
-    4: (1, 1),
-    5: (2, 0),
-    6: (2, 1),
+    1: (0, 0), 2: (0, 1),
+    3: (1, 0), 4: (1, 1),
+    5: (2, 0), 6: (2, 1),
 }
 
 R   = 40
@@ -56,7 +53,7 @@ CH  = PAD + (R * 2 + PAD) * 3
 
 
 def make_pattern(servo_num: int) -> str:
-    """servo_num 1-6 → 6-char pattern with only that servo active. 0 = all down."""
+    """servo_num 1-6 → only that servo active. 0 = all down."""
     return ''.join('1' if i == servo_num - 1 else '0' for i in range(6))
 
 
@@ -65,12 +62,13 @@ def init_serial():
         print("[Serial] pyserial not installed.")
         return None
     try:
-        ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
-        time.sleep(2)
+        # No sleep here — we start reading immediately so we catch startup messages
+        ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=2)
         print(f"[Serial] Connected: {SERIAL_PORT}")
         return ser
     except Exception as e:
         print(f"[Serial] Could not connect: {e}")
+        print("[Serial] Check that Arduino is plugged in and SERIAL_PORT is correct.")
         return None
 
 
@@ -89,62 +87,71 @@ class ServoTestApp(tk.Tk):
     def __init__(self, ser):
         super().__init__()
         self.ser = ser
-        self._active = 0          # which servo is currently up (0 = none)
+        self._active = 0
         self._last_key_time = 0.0
+        self._ready = False     # keyboard locked until startup check finishes
 
-        self.title("Servo Individual Test — press 1–6")
+        self.title("Servo Individual Test")
         self.resizable(False, False)
         self.configure(bg="#1a1a2e")
 
         self._build_ui()
 
-        for i in range(7):           # 0–6
+        if ser:
+            threading.Thread(target=self._listen_startup, daemon=True).start()
+            # Safety unlock if Arduino never sends READY (e.g. old sketch)
+            self.after(15000, self._startup_timeout)
+        else:
+            self._ready = True
+            self._status_var.set("No Arduino — display only")
+            self._sub_var.set("Keyboard active. Press 1–6.")
+
+        for i in range(7):
             self.bind(str(i), self._on_key)
         self.bind("<Escape>", lambda _: self._quit())
         self.protocol("WM_DELETE_WINDOW", self._quit)
 
+    # ── UI ──────────────────────────────────────────────────────
+
     def _build_ui(self):
         bg = "#1a1a2e"
+
         tk.Label(self, text="Servo Individual Test",
                  font=("Helvetica", 18, "bold"), fg="#eee", bg=bg).pack(pady=(16, 2))
-        tk.Label(self, text="Press 1–6 to activate one servo   •   0 = all down   •   ESC = quit",
-                 font=("Helvetica", 11), fg="#888", bg=bg).pack(pady=(0, 4))
+
+        tk.Label(self, text="1–6 = one servo   •   0 = all down   •   ESC = quit",
+                 font=("Helvetica", 11), fg="#666", bg=bg).pack(pady=(0, 6))
 
         connected = self.ser is not None
         tk.Label(self,
-                 text=f"Arduino: {'CONNECTED' if connected else 'NOT CONNECTED — display only'}",
+                 text=f"Arduino: {'CONNECTED  (' + SERIAL_PORT + ')' if connected else 'NOT CONNECTED — display only'}",
                  font=("Helvetica", 10, "bold"),
-                 fg="#2ecc71" if connected else "#e67e22", bg=bg).pack(pady=(0, 14))
+                 fg="#2ecc71" if connected else "#e67e22", bg=bg).pack(pady=(0, 12))
 
-        # 2×3 grid of servo indicators
-        grid_frame = tk.Frame(self, bg=bg)
-        grid_frame.pack()
-
-        self._canvas = tk.Canvas(grid_frame, width=CW, height=CH,
+        # 2×3 servo grid
+        self._canvas = tk.Canvas(self, width=CW, height=CH,
                                   bg="#0d0d1a", highlightthickness=0)
         self._canvas.pack()
         self._circles: dict[int, int] = {}
-        self._labels: dict[int, int] = {}
+        self._circle_labels: dict[int, int] = {}
         self._draw_grid()
 
-        # Big status label
-        self._status_var = tk.StringVar(value="Press a number key")
+        # Status text
+        self._status_var = tk.StringVar(
+            value="Running startup check — watch all servos move…" if self.ser else "No Arduino"
+        )
         tk.Label(self, textvariable=self._status_var,
-                 font=("Helvetica", 22, "bold"), fg="#fff", bg=bg).pack(pady=(18, 4))
+                 font=("Helvetica", 20, "bold"), fg="#fff", bg=bg).pack(pady=(16, 2))
 
-        self._pattern_var = tk.StringVar(value="pattern: ——————")
+        self._sub_var = tk.StringVar(
+            value="Waiting for Arduino…" if self.ser else ""
+        )
+        tk.Label(self, textvariable=self._sub_var,
+                 font=("Helvetica", 13), fg="#7fb3f5", bg=bg).pack()
+
+        self._pattern_var = tk.StringVar(value="")
         tk.Label(self, textvariable=self._pattern_var,
-                 font=("Courier", 15), fg="#aaa", bg=bg).pack()
-
-        self._pos_var = tk.StringVar(value="")
-        tk.Label(self, textvariable=self._pos_var,
-                 font=("Helvetica", 13), fg="#7fb3f5", bg=bg).pack(pady=(4, 20))
-
-    def _dot_xy(self, servo: int):
-        row, col = SERVO_GRID[servo]
-        x = PAD + R + col * (R * 2 + PAD)
-        y = PAD + R + row * (R * 2 + PAD)
-        return x, y
+                 font=("Courier", 15), fg="#aaa", bg=bg).pack(pady=(4, 20))
 
     def _draw_grid(self):
         for n in range(1, 7):
@@ -158,18 +165,83 @@ class ServoTestApp(tk.Tk):
                 font=("Helvetica", 22, "bold"), fill="#666",
             )
             self._circles[n] = cid
-            self._labels[n] = lid
+            self._circle_labels[n] = lid
 
-    def _render(self, active: int):
+    def _dot_xy(self, servo: int):
+        row, col = SERVO_GRID[servo]
+        x = PAD + R + col * (R * 2 + PAD)
+        y = PAD + R + row * (R * 2 + PAD)
+        return x, y
+
+    def _render(self, active: list[int], color: str = "#f39c12") -> None:
         for n in range(1, 7):
-            on = (n == active)
+            on = n in active
             self._canvas.itemconfig(self._circles[n],
-                                     fill="#f39c12" if on else "#2a2a4a",
+                                     fill=color if on else "#2a2a4a",
                                      outline="#f1c40f" if on else "#555")
-            self._canvas.itemconfig(self._labels[n],
+            self._canvas.itemconfig(self._circle_labels[n],
                                      fill="#111" if on else "#666")
 
-    def _on_key(self, event):
+    # ── Startup listener ────────────────────────────────────────
+
+    def _listen_startup(self) -> None:
+        """Background thread: read Arduino startup messages and mirror them on screen."""
+        try:
+            while True:
+                raw = self.ser.readline()
+                if not raw:
+                    continue
+                line = raw.decode(errors="ignore").strip()
+                if not line:
+                    continue
+                print(f"[Arduino] {line}")
+                self.after(0, self._handle_startup_msg, line)
+                if line == "READY":
+                    break
+        except Exception as e:
+            print(f"[Startup listener] {e}")
+
+    def _handle_startup_msg(self, msg: str) -> None:
+        if msg == "ALL_UP":
+            self._render(list(range(1, 7)), color="#3498db")
+            self._status_var.set("All 6 servos UP")
+            self._sub_var.set("If any didn't move, it may not be wired correctly.")
+
+        elif msg == "ALL_DOWN":
+            self._render([])
+            self._status_var.set("All 6 servos DOWN")
+            self._sub_var.set("Sequential test starting…")
+
+        elif msg.startswith("SERVO_"):
+            try:
+                n = int(msg.split("_")[1])
+                self._render([n], color="#2ecc71")
+                self._status_var.set(f"Testing servo {n}  ({SERVO_POSITIONS[n]})")
+                self._sub_var.set("Watch which physical pin moved.")
+            except ValueError:
+                pass
+
+        elif msg == "READY":
+            self._render([])
+            self._ready = True
+            self._status_var.set("Startup complete — press 1–6")
+            self._sub_var.set("Each key moves only that one servo.")
+            self._pattern_var.set("")
+
+    def _startup_timeout(self) -> None:
+        if not self._ready:
+            self._ready = True
+            self._render([])
+            self._status_var.set("Press 1–6 to test each servo")
+            self._sub_var.set("(Tip: upload the updated Arduino sketch to see the startup animation)")
+            print("[Startup] Timeout — keyboard now active")
+
+    # ── Key handler ─────────────────────────────────────────────
+
+    def _on_key(self, event) -> None:
+        if not self._ready:
+            self._sub_var.set("Wait for startup check to finish…")
+            return
         now = time.time()
         if now - self._last_key_time < 0.15:
             return
@@ -181,23 +253,24 @@ class ServoTestApp(tk.Tk):
             return
 
         pattern = make_pattern(n)
-        self._active = n
-        self._render(n)
 
         if n == 0:
+            self._render([])
             self._status_var.set("ALL DOWN — reset")
-            self._pattern_var.set(f"pattern: {pattern}")
-            self._pos_var.set("")
+            self._sub_var.set("")
+            self._pattern_var.set(f"serial → \"{pattern}\"")
         else:
-            pos = SERVO_POSITIONS[n]
-            self._status_var.set(f"Servo {n} → UP")
-            self._pattern_var.set(f"pattern: {pattern}")
-            self._pos_var.set(f"position: {pos}")
+            self._render([n])
+            self._status_var.set(f"Servo {n}  ({SERVO_POSITIONS[n]})  →  UP")
+            self._sub_var.set("All other servos are DOWN.")
+            self._pattern_var.set(f"serial → \"{pattern}\"")
 
         print(f"[Test] Servo {n}  pattern={pattern}")
         send_pattern(pattern, self.ser)
 
-    def _quit(self):
+    # ── Quit ────────────────────────────────────────────────────
+
+    def _quit(self) -> None:
         if self.ser:
             try:
                 send_pattern("000000", self.ser)
@@ -209,9 +282,9 @@ class ServoTestApp(tk.Tk):
 
 
 def main():
-    print("=" * 50)
+    print("=" * 54)
     print("  Servo Individual Test")
-    print("=" * 50)
+    print("=" * 54)
     ser = init_serial()
     print()
     app = ServoTestApp(ser)
@@ -220,3 +293,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+```
