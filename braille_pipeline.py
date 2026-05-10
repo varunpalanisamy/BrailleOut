@@ -95,8 +95,13 @@ CAM_W = 480
 CAM_H = 360
 
 
+# Physical servo order matches left→right, top→bottom wiring:
+# servo0=top-left(dot1), servo1=top-right(dot4), servo2=mid-left(dot2),
+# servo3=mid-right(dot5), servo4=bot-left(dot3), servo5=bot-right(dot6)
+_SERVO_DOT_ORDER = [1, 4, 2, 5, 3, 6]
+
 def dots_to_pattern(dots: list[int]) -> str:
-    return ''.join('1' if d in dots else '0' for d in range(1, 7))
+    return ''.join('1' if d in dots else '0' for d in _SERVO_DOT_ORDER)
 
 
 # ============================================================
@@ -109,7 +114,7 @@ def init_serial():
         return None
     try:
         ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
-        time.sleep(2)
+        time.sleep(2)  # wait for Arduino bootloader to finish
         print(f"[Serial] Connected: {SERIAL_PORT} @ {SERIAL_BAUD} baud.")
         return ser
     except Exception as e:
@@ -290,6 +295,11 @@ class BraillePipelineApp(tk.Tk):
         tk.Label(self, text="HackDavis 2026 — AI Braille Display",
                  font=("Helvetica", 16, "bold"), bg=bg).pack(pady=(12, 2))
 
+        arduino_txt = f"Arduino: connected ({SERIAL_PORT})" if self.ser else "Arduino: not connected (display only)"
+        arduino_col = "#27ae60" if self.ser else "#aaa"
+        tk.Label(self, text=arduino_txt, font=("Helvetica", 10, "bold"),
+                 fg=arduino_col, bg=bg).pack(pady=(0, 4))
+
         # Top row: live camera | braille cell
         top = tk.Frame(self, bg=bg)
         top.pack(padx=20, pady=8)
@@ -404,6 +414,7 @@ class BraillePipelineApp(tk.Tk):
         if self._last_frame is None:
             self._set_status("No camera frame yet — wait a moment.", error=True)
             return
+        send_to_arduino("000000", self.ser)  # reset all servos before new capture
         self._processing = True
         self._capture_btn.configure(state=tk.DISABLED, text="Processing…")
         self._set_status("Sending to Gemini Vision OCR… (this takes a few seconds)")
@@ -468,6 +479,12 @@ class BraillePipelineApp(tk.Tk):
         self._status_label.configure(fg="#c0392b" if error else "#555")
 
     def _quit(self) -> None:
+        if self.ser:
+            try:
+                send_to_arduino("000000", self.ser)
+                time.sleep(0.1)
+            except Exception:
+                pass
         if self._cap.isOpened():
             self._cap.release()
         self.destroy()
