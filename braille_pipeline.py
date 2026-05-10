@@ -22,7 +22,6 @@ import sys
 import time
 import threading
 import subprocess
-import tempfile
 import tkinter as tk
 from PIL import Image, ImageTk
 
@@ -49,8 +48,6 @@ except ImportError:
 ANTHROPIC_API_KEY   = os.getenv("ANTHROPIC_API_KEY", "")
 GEMINI_API_KEY      = os.getenv("GEMINI_API_KEY", "")
 GEMINI_VISION_MODEL = "gemini-2.5-flash"
-ELEVENLABS_API_KEY  = os.getenv("ELEVENLABS_API_KEY", "")
-ELEVENLABS_VOICE_ID = "EXAVITQu4vr4xnSDxMaL"    # Rachel — natural female
 SERIAL_PORT         = "/dev/cu.usbmodem1051DB2BD6802"     # change to match your Arduino
 SERIAL_BAUD         = 9600
 CLAUDE_MODEL        = "claude-sonnet-4-6"
@@ -134,66 +131,15 @@ def send_to_arduino(pattern: str, ser) -> None:
 
 
 # ============================================================
-#  TTS — ElevenLabs → pyttsx3 → macOS say
+#  TTS — macOS say
 # ============================================================
-
-def _speak_elevenlabs(text: str) -> bool:
-    if not ELEVENLABS_API_KEY:
-        return False
-    try:
-        import requests
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
-        resp = requests.post(
-            url,
-            headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
-            json={
-                "text": text,
-                "model_id": "eleven_monolingual_v1",
-                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
-            },
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                f.write(resp.content)
-                tmp = f.name
-            subprocess.Popen(["afplay", tmp])
-            return True
-        print(f"[TTS] ElevenLabs {resp.status_code}: {resp.text[:80]}")
-    except Exception as e:
-        print(f"[TTS] ElevenLabs error: {e}")
-    return False
-
-
-def _speak_pyttsx3(text: str) -> bool:
-    try:
-        import pyttsx3
-        engine = pyttsx3.init()
-        engine.say(text)
-        engine.runAndWait()
-        return True
-    except Exception as e:
-        print(f"[TTS] pyttsx3 error: {e}")
-    return False
-
-
-def _speak_say(text: str) -> None:
-    try:
-        subprocess.Popen(["say", text])
-    except Exception:
-        pass
-
 
 def speak_async(text: str) -> None:
     def _run():
-        if _speak_elevenlabs(text):
-            print(f"[TTS] ElevenLabs spoke: '{text}'")
-            return
-        if _speak_pyttsx3(text):
-            print(f"[TTS] pyttsx3 spoke: '{text}'")
-            return
-        _speak_say(text)
-        print(f"[TTS] macOS say spoke: '{text}'")
+        try:
+            subprocess.Popen(["say", text])
+        except Exception:
+            pass
     threading.Thread(target=_run, daemon=True).start()
 
 
@@ -268,6 +214,8 @@ class BraillePipelineApp(tk.Tk):
         self.idx = -1
         self._processing = False
         self._last_frame = None
+        self._auto_mode = False
+        self._auto_job = None
 
         self.title("HackDavis 2026 — AI Braille Display")
         self.resizable(False, False)
@@ -364,6 +312,28 @@ class BraillePipelineApp(tk.Tk):
                   bg="#ddd", fg="#333", activebackground="#bbb",
                   command=lambda: self._advance(+1), **btn_style).pack(side=tk.LEFT, padx=4)
 
+        self._auto_btn = tk.Button(btn_row, text="▶ AUTO",
+                                    bg="#27ae60", fg="#fff",
+                                    activebackground="#1e8449",
+                                    command=self._toggle_auto, **btn_style)
+        self._auto_btn.pack(side=tk.LEFT, padx=8)
+
+        # Delay slider (0.3s – 5.0s)
+        delay_row = tk.Frame(self, bg=bg)
+        delay_row.pack(pady=(0, 4))
+        tk.Label(delay_row, text="Auto delay:", font=("Helvetica", 11), fg="#555", bg=bg).pack(side=tk.LEFT)
+        self._delay_var = tk.DoubleVar(value=1.0)
+        self._delay_slider = tk.Scale(delay_row, from_=0.3, to=5.0, resolution=0.1,
+                                       orient=tk.HORIZONTAL, length=200,
+                                       variable=self._delay_var,
+                                       bg=bg, fg="#333", highlightthickness=0,
+                                       troughcolor="#ddd")
+        self._delay_slider.pack(side=tk.LEFT, padx=6)
+        self._delay_label = tk.Label(delay_row, textvariable=self._delay_var,
+                                      font=("Helvetica", 11), fg="#555", bg=bg, width=3)
+        self._delay_label.pack(side=tk.LEFT)
+        tk.Label(delay_row, text="sec", font=("Helvetica", 11), fg="#555", bg=bg).pack(side=tk.LEFT)
+
         # Status bar
         self._status_var = tk.StringVar(value="Point camera at text, then press CAPTURE TEXT.")
         self._status_label = tk.Label(self, textvariable=self._status_var,
@@ -414,21 +384,44 @@ class BraillePipelineApp(tk.Tk):
         if self._last_frame is None:
             self._set_status("No camera frame yet — wait a moment.", error=True)
             return
-        send_to_arduino("000000", self.ser)  # reset all servos before new capture
+        self._stop_auto()
+        send_to_arduino("000000", self.ser)
         self._processing = True
         self._capture_btn.configure(state=tk.DISABLED, text="Processing…")
+        self._auto_btn.configure(state=tk.DISABLED)
         self._set_status("Sending to Gemini Vision OCR… (this takes a few seconds)")
         threading.Thread(target=self._process, args=(self._last_frame.copy(),), daemon=True).start()
+        # Safety: force-unlock after 45s if thread never returns
+        self.after(45000, self._unlock_if_stuck)
 
     def _process(self, frame) -> None:
-        raw = ocr_frame(frame)
-        cleaned = clean_text_with_claude(raw)
-        letters = [ch for ch in cleaned.lower() if ch in BRAILLE]
-        self.after(0, self._on_process_done, letters, cleaned)
+        try:
+            raw = ocr_frame(frame)
+            cleaned = clean_text_with_claude(raw)
+            letters = [ch for ch in cleaned.lower() if ch in BRAILLE]
+            self.after(0, self._on_process_done, letters, cleaned)
+        except Exception as e:
+            print(f"[Pipeline] ERROR in processing thread: {e}")
+            self.after(0, self._on_process_error, str(e))
+
+    def _unlock_if_stuck(self) -> None:
+        if self._processing:
+            print("[Pipeline] Processing timed out — force-unlocking.")
+            self._processing = False
+            self._capture_btn.configure(state=tk.NORMAL, text="CAPTURE TEXT")
+            self._auto_btn.configure(state=tk.NORMAL)
+            self._set_status("OCR timed out — try again.", error=True)
+
+    def _on_process_error(self, msg: str) -> None:
+        self._processing = False
+        self._capture_btn.configure(state=tk.NORMAL, text="CAPTURE TEXT")
+        self._auto_btn.configure(state=tk.NORMAL)
+        self._set_status(f"Error: {msg} — try again.", error=True)
 
     def _on_process_done(self, letters: list[str], cleaned: str) -> None:
         self._processing = False
         self._capture_btn.configure(state=tk.NORMAL, text="CAPTURE TEXT")
+        self._auto_btn.configure(state=tk.NORMAL)
         if not letters:
             ocr_preview = repr(cleaned) if cleaned else "(empty)"
             self._set_status(
@@ -470,7 +463,42 @@ class BraillePipelineApp(tk.Tk):
 
         print(f"[Display] '{ch}'  dots:{dot_str}  pattern:{pattern}")
         send_to_arduino(pattern, self.ser)
+        # Pulse: send reset immediately so servo goes up then straight back down
+        self.after(300, lambda: send_to_arduino("000000", self.ser))
         speak_async("space" if ch == " " else ch)
+
+    # ---- Auto mode ---------------------------------------------
+
+    def _toggle_auto(self) -> None:
+        if self._auto_mode:
+            self._stop_auto()
+        else:
+            if not self.letters:
+                self._set_status("Capture some text first!", error=True)
+                return
+            self._auto_mode = True
+            self._auto_btn.configure(text="⏹ STOP", bg="#e74c3c", activebackground="#c0392b")
+            self._capture_btn.configure(state=tk.DISABLED)
+            self._run_auto()
+
+    def _run_auto(self) -> None:
+        if not self._auto_mode:
+            return
+        if self.idx + 1 >= len(self.letters):
+            self._stop_auto()
+            self._set_status("Auto complete — all letters displayed.")
+            return
+        self._advance(+1)
+        delay_ms = int(self._delay_var.get() * 1000)
+        self._auto_job = self.after(delay_ms, self._run_auto)
+
+    def _stop_auto(self) -> None:
+        self._auto_mode = False
+        self._auto_btn.configure(text="▶ AUTO", bg="#27ae60", activebackground="#1e8449")
+        self._capture_btn.configure(state=tk.NORMAL)
+        if self._auto_job:
+            self.after_cancel(self._auto_job)
+            self._auto_job = None
 
     # ---- Helpers -----------------------------------------------
 
@@ -505,7 +533,6 @@ def print_startup_banner() -> None:
     print("API key status:")
     print(_check("ANTHROPIC_API_KEY  (Claude cleanup) ", ANTHROPIC_API_KEY))
     print(_check("GEMINI_API_KEY     (Vision OCR)     ", GEMINI_API_KEY))
-    print(_check("ELEVENLABS_API_KEY (TTS voice)      ", ELEVENLABS_API_KEY))
     print(f"\nModels:  Gemini={GEMINI_VISION_MODEL}  Claude={CLAUDE_MODEL}")
     print(f"Serial:  {SERIAL_PORT} @ {SERIAL_BAUD} baud")
     print(f"Webcam:  index {WEBCAM_INDEX}")
