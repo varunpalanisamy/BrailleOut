@@ -2,10 +2,10 @@
 """
 braille_pipeline.py  —  HackDavis 2026 AI Braille Display
 ==========================================================
-Full pipeline: webcam → Gemini Vision OCR → Claude cleanup → Braille display → Arduino → TTS
+Full pipeline: webcam (live in UI) → Gemini Vision OCR → Claude cleanup → Braille display → Arduino → TTS
 
 INSTALL (Python packages):
-    pip install opencv-python google-generativeai anthropic pyserial pyttsx3 requests
+    pip install opencv-python Pillow google-generativeai anthropic pyserial pyttsx3 requests python-dotenv
 
 ENVIRONMENT VARIABLES (optional — can also hardcode below):
     export ANTHROPIC_API_KEY="sk-ant-..."
@@ -24,11 +24,17 @@ import threading
 import subprocess
 import tempfile
 import tkinter as tk
+from PIL import Image, ImageTk
 
-import base64
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 import cv2
-import google.generativeai as genai
+from google import genai as google_genai
+from google.genai import types as genai_types
 import anthropic
 
 try:
@@ -42,12 +48,12 @@ except ImportError:
 # ============================================================
 ANTHROPIC_API_KEY   = os.getenv("ANTHROPIC_API_KEY", "")
 GEMINI_API_KEY      = os.getenv("GEMINI_API_KEY", "")
-GEMINI_VISION_MODEL = "gemini-2.0-flash"
+GEMINI_VISION_MODEL = "gemini-2.5-flash"
 ELEVENLABS_API_KEY  = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = "EXAVITQu4vr4xnSDxMaL"    # Rachel — natural female
-SERIAL_PORT         = "/dev/cu.usbmodem14101"     # change to match your Arduino
+SERIAL_PORT         = "/dev/cu.usbmodem1051DB2BD6802"     # change to match your Arduino
 SERIAL_BAUD         = 9600
-CLAUDE_MODEL        = "claude-sonnet-4-6"         # note: "claude-sonnet-4-20250514" is deprecated
+CLAUDE_MODEL        = "claude-sonnet-4-6"
 WEBCAM_INDEX        = 0
 
 SYSTEM_PROMPT = (
@@ -74,109 +80,27 @@ BRAILLE: dict[str, list[int]] = {
     ' ': [],
 }
 
+_DOT_POS = {
+    1: (0, 0), 4: (0, 1),
+    2: (1, 0), 5: (1, 1),
+    3: (2, 0), 6: (2, 1),
+}
+
+_R   = 30   # dot radius px
+_PAD = 16   # padding px
+_CW  = _PAD + (_R * 2 + _PAD) * 2
+_CH  = _PAD + (_R * 2 + _PAD) * 3
+
+CAM_W = 480
+CAM_H = 360
+
 
 def dots_to_pattern(dots: list[int]) -> str:
-    """[1,4] → '100100'  (bit i=1 means dot i is raised)"""
     return ''.join('1' if d in dots else '0' for d in range(1, 7))
 
 
 # ============================================================
-#  STEP 1 — Webcam capture
-# ============================================================
-
-def capture_frame():
-    print("\n[Step 1] Webcam opening… press SPACE to capture, Q to quit.")
-    cap = cv2.VideoCapture(WEBCAM_INDEX)
-    if not cap.isOpened():
-        print("[Step 1] ERROR: cannot open webcam.")
-        sys.exit(1)
-
-    frame = None
-    while True:
-        ok, f = cap.read()
-        if not ok:
-            continue
-        cv2.imshow("Braille Camera — SPACE to capture | Q to quit", f)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord(' '):
-            frame = f.copy()
-            print("[Step 1] Frame captured.")
-            break
-        elif key == ord('q'):
-            cap.release()
-            cv2.destroyAllWindows()
-            sys.exit(0)
-
-    cap.release()
-    cv2.destroyAllWindows()
-    return frame
-
-
-# ============================================================
-#  STEP 2 — OCR
-# ============================================================
-
-def ocr_frame(frame) -> str:
-    print("\n[Step 2] Sending image to Gemini Vision for OCR…")
-    _, buf = cv2.imencode(".jpg", frame)
-    image_part = {
-        "mime_type": "image/jpeg",
-        "data": base64.b64encode(buf.tobytes()).decode(),
-    }
-    genai.configure(api_key=GEMINI_API_KEY or None)
-    model = genai.GenerativeModel(GEMINI_VISION_MODEL)
-    try:
-        response = model.generate_content([
-            image_part,
-            "Extract all text visible in this image. Return the raw text only — no commentary, no formatting, no markdown.",
-        ])
-        raw = response.text.strip()
-    except Exception as e:
-        print(f"[Step 2] Gemini error: {e}")
-        raw = ""
-    print(f"[Step 2] Gemini OCR result:\n{raw or '(empty)'}\n")
-    return raw
-
-
-# ============================================================
-#  STEP 3 — Claude cleanup (system prompt cached)
-# ============================================================
-
-def clean_text_with_claude(raw_text: str) -> str:
-    print("[Step 3] Sending to Claude for cleanup…")
-    if not raw_text.strip():
-        print("[Step 3] Nothing to clean.")
-        return ""
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY or None)
-    try:
-        response = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=1024,
-            system=[
-                {
-                    "type": "text",
-                    "text": SYSTEM_PROMPT,
-                    # Static system prompt → cache it so repeated runs are cheaper
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            messages=[{"role": "user", "content": raw_text}],
-        )
-        cleaned = response.content[0].text.strip()
-        print(f"[Step 3] Cleaned: {cleaned!r}")
-        cr = getattr(response.usage, "cache_read_input_tokens", 0)
-        cw = getattr(response.usage, "cache_creation_input_tokens", 0)
-        if cr or cw:
-            print(f"[Step 3] Prompt cache — read: {cr} tok, write: {cw} tok")
-        return cleaned
-    except anthropic.APIError as e:
-        print(f"[Step 3] Claude error: {e}  — falling back to raw OCR text.")
-        return raw_text.strip()
-
-
-# ============================================================
-#  STEP 6 — Serial output to Arduino
+#  SERIAL
 # ============================================================
 
 def init_serial():
@@ -185,7 +109,7 @@ def init_serial():
         return None
     try:
         ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
-        time.sleep(2)  # wait for Arduino bootloader
+        time.sleep(2)
         print(f"[Serial] Connected: {SERIAL_PORT} @ {SERIAL_BAUD} baud.")
         return ser
     except Exception as e:
@@ -205,8 +129,7 @@ def send_to_arduino(pattern: str, ser) -> None:
 
 
 # ============================================================
-#  STEP 7 — Voice output
-#  Priority: ElevenLabs → pyttsx3 → macOS say
+#  TTS — ElevenLabs → pyttsx3 → macOS say
 # ============================================================
 
 def _speak_elevenlabs(text: str) -> bool:
@@ -259,66 +182,186 @@ def _speak_say(text: str) -> None:
 def speak_async(text: str) -> None:
     def _run():
         if _speak_elevenlabs(text):
+            print(f"[TTS] ElevenLabs spoke: '{text}'")
             return
         if _speak_pyttsx3(text):
+            print(f"[TTS] pyttsx3 spoke: '{text}'")
             return
         _speak_say(text)
+        print(f"[TTS] macOS say spoke: '{text}'")
     threading.Thread(target=_run, daemon=True).start()
 
 
 # ============================================================
-#  STEP 5 — tkinter Braille cell display
+#  OCR + CLEANUP
 # ============================================================
 
-_DOT_POS = {
-    1: (0, 0), 4: (0, 1),
-    2: (1, 0), 5: (1, 1),
-    3: (2, 0), 6: (2, 1),
-}
-_R   = 30   # dot radius px
-_PAD = 16   # padding px
-_CW  = _PAD + (_R * 2 + _PAD) * 2
-_CH  = _PAD + (_R * 2 + _PAD) * 3
+def ocr_frame(frame) -> str:
+    print("[Step 2] Encoding frame and calling Gemini Vision…")
+    _, buf = cv2.imencode(".jpg", frame)
+    image_bytes = buf.tobytes()
+    client = google_genai.Client(api_key=GEMINI_API_KEY or None)
+    t0 = time.time()
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_VISION_MODEL,
+            contents=[
+                genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                "Extract all text visible in this image. Return the raw text only — no commentary, no formatting, no markdown.",
+            ],
+        )
+        raw = response.text.strip()
+        print(f"[Step 2] Gemini responded in {time.time()-t0:.1f}s")
+    except Exception as e:
+        print(f"[Step 2] Gemini ERROR: {e}")
+        raw = ""
+    print(f"[Step 2] Raw OCR:\n--- START ---\n{raw or '(empty)'}\n--- END ---")
+    return raw
 
 
-class BrailleDisplay(tk.Tk):
-    def __init__(self, letters: list[str], ser):
+def clean_text_with_claude(raw_text: str) -> str:
+    print("[Step 3] Sending to Claude for text cleanup…")
+    if not raw_text.strip():
+        print("[Step 3] Nothing to clean — skipping Claude call.")
+        return ""
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY or None)
+    t0 = time.time()
+    try:
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=1024,
+            system=[
+                {
+                    "type": "text",
+                    "text": SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            messages=[{"role": "user", "content": raw_text}],
+        )
+        cleaned = response.content[0].text.strip()
+        print(f"[Step 3] Claude responded in {time.time()-t0:.1f}s → {cleaned!r}")
+        cr = getattr(response.usage, "cache_read_input_tokens", 0)
+        cw = getattr(response.usage, "cache_creation_input_tokens", 0)
+        if cr or cw:
+            print(f"[Step 3] Cache — read: {cr} tok, write: {cw} tok")
+        return cleaned
+    except anthropic.APIError as e:
+        print(f"[Step 3] Claude ERROR: {e}")
+        return raw_text.strip()
+
+
+# ============================================================
+#  UNIFIED PIPELINE APP
+# ============================================================
+
+class BraillePipelineApp(tk.Tk):
+    def __init__(self, ser):
         super().__init__()
-        self.letters = letters
         self.ser = ser
+        self.letters: list[str] = []
         self.idx = -1
+        self._processing = False
+        self._last_frame = None
 
-        self.title("HackDavis Braille Display")
+        self.title("HackDavis 2026 — AI Braille Display")
         self.resizable(False, False)
         self.configure(bg="#f5f5f0")
 
-        tk.Label(self, text="HackDavis Braille Display",
-                 font=("Helvetica", 16, "bold"), bg="#f5f5f0").pack(pady=(14, 0))
-        tk.Label(self, text="SPACE → next letter   ESC → quit",
-                 font=("Helvetica", 11), fg="#888", bg="#f5f5f0").pack(pady=(2, 12))
+        self._build_ui()
 
-        self.canvas = tk.Canvas(self, width=_CW, height=_CH,
-                                bg="#fff", highlightthickness=2,
-                                highlightbackground="#ccc")
-        self.canvas.pack(padx=40)
+        self._cap = cv2.VideoCapture(WEBCAM_INDEX)
+        if not self._cap.isOpened():
+            self._set_status("ERROR: cannot open webcam.", error=True)
+        else:
+            self._update_camera()
 
-        self.letter_var = tk.StringVar(value="—")
-        tk.Label(self, textvariable=self.letter_var,
-                 font=("Helvetica", 60, "bold"), bg="#f5f5f0").pack(pady=(14, 2))
+        self.bind("<space>",  lambda _: self._advance(+1))
+        self.bind("<Left>",   lambda _: self._advance(-1))
+        self.bind("<Right>",  lambda _: self._advance(+1))
+        self.bind("<Escape>", lambda _: self._quit())
+        self.protocol("WM_DELETE_WINDOW", self._quit)
 
-        self.info_var = tk.StringVar(value="press SPACE to begin")
-        tk.Label(self, textvariable=self.info_var,
-                 font=("Helvetica", 11), fg="#888", bg="#f5f5f0").pack()
+    # ---- UI construction ----------------------------------------
 
-        self.prog_var = tk.StringVar(value=f"0 / {len(letters)} letters")
-        tk.Label(self, textvariable=self.prog_var,
-                 font=("Helvetica", 10), fg="#bbb", bg="#f5f5f0").pack(pady=(4, 20))
+    def _build_ui(self):
+        bg = "#f5f5f0"
 
+        tk.Label(self, text="HackDavis 2026 — AI Braille Display",
+                 font=("Helvetica", 16, "bold"), bg=bg).pack(pady=(12, 2))
+
+        # Top row: live camera | braille cell
+        top = tk.Frame(self, bg=bg)
+        top.pack(padx=20, pady=8)
+
+        # Camera feed
+        cam_frame = tk.Frame(top, bg="#000", width=CAM_W, height=CAM_H)
+        cam_frame.pack_propagate(False)
+        cam_frame.pack(side=tk.LEFT, padx=(0, 24))
+        self._cam_label = tk.Label(cam_frame, bg="#000")
+        self._cam_label.pack(fill=tk.BOTH, expand=True)
+
+        # Right: braille cell + letter info
+        right = tk.Frame(top, bg=bg)
+        right.pack(side=tk.LEFT, anchor=tk.N)
+
+        tk.Label(right, text="Braille Cell",
+                 font=("Helvetica", 12, "bold"), bg=bg).pack(pady=(0, 6))
+
+        self._canvas = tk.Canvas(right, width=_CW, height=_CH,
+                                  bg="#fff", highlightthickness=2,
+                                  highlightbackground="#ccc")
+        self._canvas.pack()
         self._ovals: dict[int, int] = {}
         self._draw_cell()
 
-        self.bind("<space>", self._advance)
-        self.bind("<Escape>", lambda _: self.destroy())
+        # Large letter
+        self._letter_var = tk.StringVar(value="—")
+        tk.Label(right, textvariable=self._letter_var,
+                 font=("Helvetica", 60, "bold"), bg=bg, width=4).pack(pady=(10, 0))
+
+        # "I see the letter: K"
+        self._see_var = tk.StringVar(value="")
+        tk.Label(right, textvariable=self._see_var,
+                 font=("Helvetica", 13), fg="#333", bg=bg).pack()
+
+        self._dots_var = tk.StringVar(value="")
+        tk.Label(right, textvariable=self._dots_var,
+                 font=("Helvetica", 10), fg="#888", bg=bg).pack(pady=(2, 0))
+
+        self._prog_var = tk.StringVar(value="— / — letters")
+        tk.Label(right, textvariable=self._prog_var,
+                 font=("Helvetica", 10), fg="#bbb", bg=bg).pack(pady=(4, 0))
+
+        # Buttons
+        btn_row = tk.Frame(self, bg=bg)
+        btn_row.pack(pady=10)
+
+        btn_style = dict(font=("Helvetica", 13, "bold"), relief=tk.FLAT,
+                         padx=18, pady=8, cursor="hand2")
+
+        self._capture_btn = tk.Button(btn_row, text="CAPTURE TEXT",
+                                       bg="#4a90d9", fg="#fff",
+                                       activebackground="#357abd",
+                                       command=self._capture, **btn_style)
+        self._capture_btn.pack(side=tk.LEFT, padx=8)
+
+        tk.Button(btn_row, text="← PREV",
+                  bg="#ddd", fg="#333", activebackground="#bbb",
+                  command=lambda: self._advance(-1), **btn_style).pack(side=tk.LEFT, padx=4)
+
+        tk.Button(btn_row, text="NEXT →",
+                  bg="#ddd", fg="#333", activebackground="#bbb",
+                  command=lambda: self._advance(+1), **btn_style).pack(side=tk.LEFT, padx=4)
+
+        # Status bar
+        self._status_var = tk.StringVar(value="Point camera at text, then press CAPTURE TEXT.")
+        self._status_label = tk.Label(self, textvariable=self._status_var,
+                                       font=("Helvetica", 11), fg="#555",
+                                       bg=bg, wraplength=720)
+        self._status_label.pack(pady=(0, 14))
+
+    # ---- Braille cell ------------------------------------------
 
     def _dot_xy(self, dot: int) -> tuple[int, int]:
         row, col = _DOT_POS[dot]
@@ -327,77 +370,137 @@ class BrailleDisplay(tk.Tk):
         return x, y
 
     def _draw_cell(self) -> None:
-        self.canvas.delete("all")
+        self._canvas.delete("all")
         self._ovals.clear()
         for dot in range(1, 7):
             x, y = self._dot_xy(dot)
-            oid = self.canvas.create_oval(
+            oid = self._canvas.create_oval(
                 x - _R, y - _R, x + _R, y + _R,
                 fill="#fff", outline="#333", width=2,
             )
             self._ovals[dot] = oid
 
-    def _render(self, active: list[int]) -> None:
+    def _render_dots(self, active: list[int]) -> None:
         for dot, oid in self._ovals.items():
-            self.canvas.itemconfig(oid, fill="#111" if dot in active else "#fff")
+            self._canvas.itemconfig(oid, fill="#111" if dot in active else "#fff")
 
-    def _advance(self, _=None) -> None:
-        self.idx += 1
-        if self.idx >= len(self.letters):
-            self.letter_var.set("✓")
-            self.info_var.set("All letters displayed.")
-            self._render([])
+    # ---- Live camera feed --------------------------------------
+
+    def _update_camera(self) -> None:
+        ok, frame = self._cap.read()
+        if ok:
+            self._last_frame = frame
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(rgb).resize((CAM_W, CAM_H), Image.BILINEAR)
+            self._tk_img = ImageTk.PhotoImage(img)
+            self._cam_label.configure(image=self._tk_img)
+        self.after(30, self._update_camera)
+
+    # ---- Capture + background OCR pipeline ---------------------
+
+    def _capture(self) -> None:
+        if self._processing:
             return
+        if self._last_frame is None:
+            self._set_status("No camera frame yet — wait a moment.", error=True)
+            return
+        self._processing = True
+        self._capture_btn.configure(state=tk.DISABLED, text="Processing…")
+        self._set_status("Sending to Gemini Vision OCR… (this takes a few seconds)")
+        threading.Thread(target=self._process, args=(self._last_frame.copy(),), daemon=True).start()
 
+    def _process(self, frame) -> None:
+        raw = ocr_frame(frame)
+        cleaned = clean_text_with_claude(raw)
+        letters = [ch for ch in cleaned.lower() if ch in BRAILLE]
+        self.after(0, self._on_process_done, letters, cleaned)
+
+    def _on_process_done(self, letters: list[str], cleaned: str) -> None:
+        self._processing = False
+        self._capture_btn.configure(state=tk.NORMAL, text="CAPTURE TEXT")
+        if not letters:
+            ocr_preview = repr(cleaned) if cleaned else "(empty)"
+            self._set_status(
+                f"No displayable text found. OCR saw: {ocr_preview} — try again.",
+                error=True,
+            )
+            return
+        self.letters = letters
+        self.idx = -1
+        self._prog_var.set(f"0 / {len(letters)} letters")
+        self._set_status(f"Got {len(letters)} letter(s): {' '.join(letters)}   — press NEXT or SPACE")
+        self._render_dots([])
+        self._letter_var.set("—")
+        self._see_var.set("")
+        self._dots_var.set("")
+        print(f"\n[Pipeline] Letter queue ({len(letters)}): {' '.join(letters)}\n")
+
+    # ---- Navigation --------------------------------------------
+
+    def _advance(self, delta: int) -> None:
+        if not self.letters:
+            self._set_status("Capture some text first!", error=True)
+            return
+        new_idx = self.idx + delta
+        if new_idx < 0 or new_idx >= len(self.letters):
+            return
+        self.idx = new_idx
         ch = self.letters[self.idx]
         dots = BRAILLE.get(ch, [])
         pattern = dots_to_pattern(dots)
         dot_str = " ".join(str(d) for d in sorted(dots)) or "none"
+        display = ch.upper() if ch != " " else "(sp)"
 
-        self._render(dots)
-        self.letter_var.set(ch.upper() if ch != " " else "(sp)")
-        self.info_var.set(f"dots: {dot_str}   pattern: {pattern}")
-        self.prog_var.set(f"{self.idx + 1} / {len(self.letters)} letters")
+        self._render_dots(dots)
+        self._letter_var.set(display)
+        self._see_var.set(f"I see the letter: {display}")
+        self._dots_var.set(f"dots: {dot_str}   pattern: {pattern}")
+        self._prog_var.set(f"{self.idx + 1} / {len(self.letters)} letters")
 
-        # Terminal
         print(f"[Display] '{ch}'  dots:{dot_str}  pattern:{pattern}")
-
-        # Arduino
         send_to_arduino(pattern, self.ser)
-
-        # TTS
         speak_async("space" if ch == " " else ch)
+
+    # ---- Helpers -----------------------------------------------
+
+    def _set_status(self, msg: str, error: bool = False) -> None:
+        self._status_var.set(msg)
+        self._status_label.configure(fg="#c0392b" if error else "#555")
+
+    def _quit(self) -> None:
+        if self._cap.isOpened():
+            self._cap.release()
+        self.destroy()
 
 
 # ============================================================
 #  MAIN
 # ============================================================
 
+def _check(label: str, value: str) -> str:
+    return f"  {'✓' if value else '✗'} {label}: {'set' if value else 'MISSING'}"
+
+
+def print_startup_banner() -> None:
+    print("=" * 54)
+    print("  HackDavis 2026 — AI Braille Display Pipeline")
+    print("=" * 54)
+    print("API key status:")
+    print(_check("ANTHROPIC_API_KEY  (Claude cleanup) ", ANTHROPIC_API_KEY))
+    print(_check("GEMINI_API_KEY     (Vision OCR)     ", GEMINI_API_KEY))
+    print(_check("ELEVENLABS_API_KEY (TTS voice)      ", ELEVENLABS_API_KEY))
+    print(f"\nModels:  Gemini={GEMINI_VISION_MODEL}  Claude={CLAUDE_MODEL}")
+    print(f"Serial:  {SERIAL_PORT} @ {SERIAL_BAUD} baud")
+    print(f"Webcam:  index {WEBCAM_INDEX}")
+    print("=" * 54)
+    print()
+
+
 def main():
-    # Step 1 — capture
-    frame = capture_frame()
-
-    # Step 2 — OCR
-    raw_text = ocr_frame(frame)
-
-    # Step 3 — Claude cleanup
-    cleaned = clean_text_with_claude(raw_text)
-
-    # Build letter queue (only displayable chars)
-    letters = [ch for ch in cleaned.lower() if ch in BRAILLE]
-    if not letters:
-        print("\n[Pipeline] No displayable characters in cleaned text. Exiting.")
-        sys.exit(0)
-    print(f"\n[Pipeline] Letter queue ({len(letters)}): {' '.join(letters)}\n")
-
-    # Step 6 — serial
+    print_startup_banner()
     ser = init_serial()
-
-    # Step 5 — display (blocks until window closes)
-    print("[Step 5] Braille window open. Press SPACE to start, ESC to quit.")
-    app = BrailleDisplay(letters, ser)
+    app = BraillePipelineApp(ser)
     app.mainloop()
-
     if ser:
         ser.close()
     print("\n[Pipeline] Complete.")
