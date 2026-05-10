@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { BrailleDisplay } from '../components/BrailleDisplay';
 import { useWebcam } from '../hooks/useWebcam';
 import { useLetterNav } from '../hooks/useLetterNav';
@@ -16,7 +16,9 @@ export function CameraPage() {
   const [processing, setProcessing] = useState(false);
   const [apiError, setApiError] = useState('');
   const [streamError, setStreamError] = useState(false);
-  const [streamKey, setStreamKey] = useState(0); // bump to force img reload
+  const [streamKey, setStreamKey] = useState(0);
+  const [isLive, setIsLive] = useState(false);
+  const lastTextRef = useRef('');
 
   const [cameras, setCameras] = useState<CameraOption[]>([]);
   const [activeCamera, setActiveCamera] = useState<number | null>(null);
@@ -47,7 +49,7 @@ export function CameraPage() {
       if (data.ok) {
         setActiveCamera(data.active);
         setStreamError(false);
-        setStreamKey(k => k + 1); // reload the stream img
+        setStreamKey(k => k + 1);
       }
     } catch {
       // backend not running
@@ -56,7 +58,8 @@ export function CameraPage() {
     }
   };
 
-  const takePhoto = async () => {
+  const captureOnce = useCallback(async () => {
+    if (processing) return;
     setProcessing(true);
     setApiError('');
     try {
@@ -65,22 +68,42 @@ export function CameraPage() {
       if (data.error) throw new Error(data.error);
       const text = data.text || '';
       setOcrText(text);
-      const parsed = parseSentenceToLetters(text);
-      setLetters(parsed.length ? parsed : []);
+      if (text !== lastTextRef.current) {
+        lastTextRef.current = text;
+        const parsed = parseSentenceToLetters(text);
+        setLetters(parsed.length ? parsed : []);
+      }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       setApiError(msg.includes('fetch') ? 'Backend not running — start api_server.py' : msg);
     } finally {
       setProcessing(false);
     }
-  };
+  }, [processing]);
+
+  // Auto-capture loop: fires immediately then every 2500 ms while Live is on
+  useEffect(() => {
+    if (!isLive) return;
+    captureOnce();
+    const id = setInterval(captureOnce, 2500);
+    return () => clearInterval(id);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLive]);
+
+  // When Live mode loads new letters, start Braille auto-advance immediately
+  useEffect(() => {
+    if (isLive && letters.length > 1) {
+      nav.startAuto();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [letters]);
 
   return (
     <div className="page-two-col">
       <div className="page-main">
         <div className="section-header">
           <div className="section-title">Camera → Braille</div>
-          <div className="section-sub">Point the webcam at text, capture it, and read it in Braille.</div>
+          <div className="section-sub">Toggle Live, point the webcam at text, and watch it load into the Braille display automatically.</div>
         </div>
 
         {/* Camera selector */}
@@ -123,8 +146,8 @@ export function CameraPage() {
 
           {!streamError && (
             <div className="camera-badge">
-              <div className="live-dot" />
-              LIVE
+              <div className={`live-dot${isLive ? '' : ' inactive'}`} />
+              {isLive ? 'SCANNING' : 'LIVE'}
             </div>
           )}
 
@@ -134,13 +157,15 @@ export function CameraPage() {
           </div>
         </div>
 
-        {/* Capture button */}
+        {/* Live toggle */}
         <button
-          className="capture-btn"
-          onClick={takePhoto}
-          disabled={processing || streamError}
+          className={`capture-btn${isLive ? ' active' : ''}`}
+          onClick={() => setIsLive(v => !v)}
+          disabled={streamError}
         >
-          {processing ? 'Processing…' : '📷  Capture Text'}
+          {isLive
+            ? (processing ? '⏳ Scanning…' : '⏹ Stop Live')
+            : '▶ Live'}
         </button>
 
         {/* OCR result */}

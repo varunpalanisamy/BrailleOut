@@ -129,12 +129,23 @@ export function YouTubePage() {
           </div>
         )}
 
-        {/* Backend note */}
+        {/* Backend note / cookie instructions */}
         {status === 'idle' && (
-          <div className="card" style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: 1.7 }}>
+          <div className="card" style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: 1.8 }}>
             <strong style={{ color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>Requirements</strong>
-            Run <code style={{ fontFamily: 'var(--font-mono)', background: 'var(--bg-input)', padding: '1px 6px', borderRadius: 4 }}>python api_server.py</code> in the project root
-            before fetching transcripts. Works with most public YouTube videos that have captions.
+            Run <code style={{ fontFamily: 'var(--font-mono)', background: 'var(--bg-input)', padding: '1px 6px', borderRadius: 4 }}>python api_server.py</code> in the project root before fetching transcripts.
+          </div>
+        )}
+        {status === 'error' && errorMsg.includes('cookies') && (
+          <div className="card" style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: 1.8, marginTop: 8 }}>
+            <strong style={{ color: 'var(--text-2)', display: 'block', marginBottom: 6 }}>Fix: export your YouTube cookies</strong>
+            <ol style={{ paddingLeft: 16, margin: 0, display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <li>Install the <strong style={{ color: 'var(--text-2)' }}>Get cookies.txt LOCALLY</strong> Chrome/Firefox extension</li>
+              <li>Go to <strong style={{ color: 'var(--text-2)' }}>youtube.com</strong> while logged in</li>
+              <li>Click the extension and export cookies for the current site</li>
+              <li>Save the file as <code style={{ fontFamily: 'var(--font-mono)', background: 'var(--bg-input)', padding: '1px 5px', borderRadius: 3 }}>cookies.txt</code> in the project root (next to <code style={{ fontFamily: 'var(--font-mono)', background: 'var(--bg-input)', padding: '1px 5px', borderRadius: 3 }}>api_server.py</code>)</li>
+              <li>Restart <code style={{ fontFamily: 'var(--font-mono)', background: 'var(--bg-input)', padding: '1px 5px', borderRadius: 3 }}>api_server.py</code> and try again</li>
+            </ol>
           </div>
         )}
       </div>

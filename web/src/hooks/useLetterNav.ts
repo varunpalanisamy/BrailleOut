@@ -4,6 +4,7 @@ import { dotsToBinary, getActiveDots } from '../data/braille';
 export function useLetterNav(letters: string[]) {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isAuto, setIsAuto] = useState(false);
+  const [isRepeat, setIsRepeat] = useState(false);
   const [speed, setSpeed] = useState(1.5); // seconds between letters, minimum 0.3
   const autoRef = useRef(isAuto);
   const speedRef = useRef(speed);
@@ -18,8 +19,10 @@ export function useLetterNav(letters: string[]) {
     setCurrentIndex((i) => Math.max(i - 1, 0));
   }, []);
 
+  const startAuto = useCallback(() => setIsAuto(true), []);
   const stopAuto = useCallback(() => setIsAuto(false), []);
   const toggleAuto = useCallback(() => setIsAuto((v) => !v), []);
+  const toggleRepeat = useCallback(() => setIsRepeat((v) => !v), []);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -49,6 +52,7 @@ export function useLetterNav(letters: string[]) {
     const id = setTimeout(() => {
       setCurrentIndex((i) => {
         if (i + 1 >= letters.length) {
+          if (isRepeat) return 0;
           setIsAuto(false);
           return i;
         }
@@ -56,7 +60,7 @@ export function useLetterNav(letters: string[]) {
       });
     }, delayMs);
     return () => clearTimeout(id);
-  }, [isAuto, currentIndex, speed, letters.length]);
+  }, [isAuto, isRepeat, currentIndex, speed, letters.length]);
 
   const currentChar = letters[currentIndex] ?? '';
   const activeDots = getActiveDots(currentChar);
@@ -82,9 +86,12 @@ export function useLetterNav(letters: string[]) {
     next,
     prev,
     isAuto,
+    isRepeat,
     speed,
     setSpeed,
+    startAuto,
     toggleAuto,
+    toggleRepeat,
     stopAuto,
   };
 }

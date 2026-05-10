@@ -77,7 +77,7 @@ def arduino_status():
     return jsonify({"connected": ser is not None})
 
 # ── Webcam ──────────────────────────────────────────────────────────────────
-_webcam_index = 1  # default to external USB cam
+_webcam_index = 1  # default to external USB cam (index 1)
 _cap: cv2.VideoCapture | None = None
 _cap_lock = threading.Lock()
 
@@ -106,6 +106,33 @@ def _read_frame():
     return ok, frame if ok else None
 
 
+@app.route("/api/cameras")
+def list_cameras():
+    available = []
+    for i in range(5):
+        if i == _webcam_index and _cap is not None and _cap.isOpened():
+            available.append({"index": i, "label": f"Camera {i}{' (built-in)' if i == 0 else ' (external)'}"})
+            continue
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            available.append({"index": i, "label": f"Camera {i}{' (built-in)' if i == 0 else ' (external)'}"})
+            cap.release()
+    return jsonify({"cameras": available, "active": _webcam_index})
+
+
+@app.route("/api/set-camera", methods=["POST"])
+def set_camera():
+    global _webcam_index
+    data = request.get_json(force=True)
+    idx = data.get("index")
+    if not isinstance(idx, int):
+        return jsonify({"error": "index must be an integer"}), 400
+    with _cap_lock:
+        _release_cap()
+        _webcam_index = idx
+    return jsonify({"ok": True, "active": _webcam_index})
+
+
 def _mjpeg_stream():
     while True:
         ok, frame = _read_frame()
@@ -125,34 +152,6 @@ def _mjpeg_stream():
 def video_feed():
     return Response(_mjpeg_stream(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
-
-@app.route("/api/cameras")
-def list_cameras():
-    """Probe indices 0-4 and return which ones open successfully."""
-    available = []
-    for i in range(5):
-        # Skip the currently open cap to avoid conflict
-        if i == _webcam_index and _cap is not None and _cap.isOpened():
-            available.append({"index": i, "label": f"Camera {i}{' (built-in)' if i == 0 else ''}"})
-            continue
-        cap = cv2.VideoCapture(i)
-        if cap.isOpened():
-            available.append({"index": i, "label": f"Camera {i}{' (built-in)' if i == 0 else ''}"})
-            cap.release()
-    return jsonify({"cameras": available, "active": _webcam_index})
-
-
-@app.route("/api/set-camera", methods=["POST"])
-def set_camera():
-    global _webcam_index
-    data = request.get_json(force=True)
-    idx = data.get("index")
-    if not isinstance(idx, int):
-        return jsonify({"error": "index must be an integer"}), 400
-    with _cap_lock:
-        _release_cap()
-        _webcam_index = idx
-    return jsonify({"ok": True, "active": _webcam_index})
 
 
 def extract_video_id(url: str) -> str | None:
@@ -181,12 +180,17 @@ def get_transcript():
 
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
-        transcript = YouTubeTranscriptApi().fetch(video_id)
+        cookies_path = os.path.join(os.path.dirname(__file__), "cookies.txt")
+        api = YouTubeTranscriptApi(cookies=cookies_path) if os.path.exists(cookies_path) else YouTubeTranscriptApi()
+        transcript = api.fetch(video_id)
         raw = " ".join(snippet.text for snippet in transcript)
         text = html_lib.unescape(raw)
         return jsonify({"text": text, "video_id": video_id})
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        msg = str(exc)
+        if "blocked" in msg.lower() or "ip" in msg.lower():
+            return jsonify({"error": "YouTube blocked this request. Add a cookies.txt file to the project root to fix this — see the YouTube tab for instructions."}), 500
+        return jsonify({"error": msg}), 500
 
 
 @app.route("/api/capture", methods=["POST"])

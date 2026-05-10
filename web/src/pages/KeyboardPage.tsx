@@ -117,9 +117,11 @@ export function KeyboardPage() {
           canNext={false}
           canPrev={false}
           isAuto={false}
+          isRepeat={false}
           speed={1}
           setSpeed={() => {}}
           toggleAuto={() => {}}
+          toggleRepeat={() => {}}
         />
       </div>
     </div>
