@@ -493,6 +493,57 @@ html, body, #root {
   color: var(--text-4);
 }
 
+/* ── Camera selector ────────────────────────────────────────────────────── */
+.camera-selector {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.camera-selector-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.camera-selector-btns {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.camera-sel-btn {
+  padding: 6px 16px;
+  border-radius: var(--r-sm);
+  border: 1.5px solid var(--border-bright);
+  background: var(--bg-card-2);
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.camera-sel-btn:hover:not(:disabled):not(.active) {
+  background: rgba(124,58,237,0.07);
+  border-color: var(--border-accent);
+  color: var(--accent);
+}
+
+.camera-sel-btn.active {
+  background: rgba(124,58,237,0.12);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.camera-sel-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
 /* ── Camera page ────────────────────────────────────────────────────────── */
 .camera-wrap {
   flex: 1;
@@ -1047,6 +1098,78 @@ html, body, #root {
   padding: 6px 16px;
   border-radius: 20px;
   background: rgba(124,58,237,0.07);
+}
+
+/* ── Servo test ─────────────────────────────────────────────────────────── */
+.servo-test-section {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+
+.servo-test-btn {
+  padding: 12px 32px;
+  border-radius: var(--r-md);
+  border: 1.5px solid var(--border-accent);
+  background: rgba(124,58,237,0.08);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  transition: background 0.15s, box-shadow 0.15s, transform 0.08s;
+}
+
+.servo-test-btn:hover:not(:disabled) {
+  background: rgba(124,58,237,0.16);
+  box-shadow: 0 4px 14px rgba(124,58,237,0.2);
+  transform: translateY(-1px);
+}
+
+.servo-test-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.servo-test-btn.running {
+  border-color: var(--accent);
+  background: rgba(124,58,237,0.14);
+  animation: test-pulse 1s ease-in-out infinite;
+}
+
+@keyframes test-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(124,58,237,0.3); }
+  50%       { box-shadow: 0 0 0 8px rgba(124,58,237,0); }
+}
+
+.servo-test-status {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-bright);
+  border-radius: var(--r-md);
+  padding: 12px 20px;
+  box-shadow: 0 2px 10px rgba(124,58,237,0.08);
+}
+
+.servo-test-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.servo-test-step {
+  font-family: var(--font-mono);
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.servo-test-progress {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-3);
+  letter-spacing: 0.08em;
 }
 
 /* ── Float animation for demo cell ─────────────────────────────────────── */

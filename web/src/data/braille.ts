@@ -19,7 +19,8 @@ export function getActiveDots(char: string): number[] {
 }
 
 // Physical servo wiring order: servo positions 1-6 map to Braille dots [1,4,2,5,3,6]
-const SERVO_DOT_ORDER = [1, 4, 2, 5, 3, 6];
+// Physical wiring is sequential: servo 0→dot1, 1→dot2, 2→dot3, 3→dot4, 4→dot5, 5→dot6
+const SERVO_DOT_ORDER = [1, 2, 3, 4, 5, 6];
 
 export function dotsToBinary(dots: number[]): string {
   return SERVO_DOT_ORDER.map((d) => (dots.includes(d) ? '1' : '0')).join('');
