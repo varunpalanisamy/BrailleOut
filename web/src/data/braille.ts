@@ -18,8 +18,11 @@ export function getActiveDots(char: string): number[] {
   return BRAILLE[char.toLowerCase()] ?? [];
 }
 
+// Physical servo wiring order: servo positions 1-6 map to Braille dots [1,4,2,5,3,6]
+const SERVO_DOT_ORDER = [1, 4, 2, 5, 3, 6];
+
 export function dotsToBinary(dots: number[]): string {
-  return Array.from({ length: 6 }, (_, i) => (dots.includes(i + 1) ? '1' : '0')).join('');
+  return SERVO_DOT_ORDER.map((d) => (dots.includes(d) ? '1' : '0')).join('');
 }
 
 export function parseSentenceToLetters(sentence: string): string[] {

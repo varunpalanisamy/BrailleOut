@@ -14,7 +14,7 @@ export default function App() {
     <div className="app-shell">
       <TabBar active={tab} onChange={setTab} />
 
-      {tab === 'home'     && <HomePage    onNavigate={setTab} />}
+      {tab === 'home'     && <HomePage />}
       {tab === 'camera'   && <CameraPage   />}
       {tab === 'keyboard' && <KeyboardPage />}
       {tab === 'text'     && <TextPage     />}

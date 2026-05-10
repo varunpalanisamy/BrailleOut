@@ -31,10 +31,11 @@ export function MiniCell({ activeDots, size = 'md' }: Props) {
             cx={cx}
             cy={cy}
             r={r}
-            fill={active ? 'rgba(139,92,246,0.9)' : 'rgba(255,255,255,0.04)'}
-            stroke={active ? 'none' : 'rgba(255,255,255,0.22)'}
-            strokeWidth={active ? 0 : 1}
+            fill={active ? '#7c3aed' : 'var(--dot-inactive-fill)'}
+            stroke={active ? 'none' : 'var(--dot-inactive-stroke)'}
+            strokeWidth={active ? 0 : 1.5}
             filter={active ? 'url(#mini-glow)' : 'none'}
+            opacity={active ? 1 : 0.7}
           />
         );
       })}

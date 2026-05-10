@@ -8,7 +8,10 @@ import os
 import re
 import base64
 import html as html_lib
-from flask import Flask, jsonify, request
+import threading
+import time
+import cv2
+from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 from dotenv import load_dotenv
 
@@ -16,6 +19,102 @@ load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
+
+# ── Arduino serial ──────────────────────────────────────────────
+SERIAL_PORT = "/dev/cu.usbmodem1051DB2BD6802"
+SERIAL_BAUD = 9600
+_ser = None
+_ser_lock = threading.Lock()
+
+try:
+    import serial as _serial_mod
+    _SERIAL_LIB = True
+except ImportError:
+    _SERIAL_LIB = False
+    print("[Serial] pyserial not installed — Arduino output disabled")
+
+def _get_serial():
+    global _ser
+    if not _SERIAL_LIB:
+        return None
+    with _ser_lock:
+        if _ser is None or not _ser.isOpen():
+            try:
+                _ser = _serial_mod.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
+                time.sleep(2)
+                print(f"[Serial] Connected: {SERIAL_PORT}")
+            except Exception as e:
+                print(f"[Serial] Could not connect: {e}")
+                _ser = None
+    return _ser
+
+def _send_to_arduino(pattern: str):
+    ser = _get_serial()
+    if ser is None:
+        return
+    def _go():
+        try:
+            with _ser_lock:
+                ser.write((pattern + "\n").encode())
+        except Exception as ex:
+            print(f"[Serial] Write error: {ex}")
+    threading.Thread(target=_go, daemon=True).start()
+
+@app.route("/api/send-pattern", methods=["POST"])
+def send_pattern():
+    data = request.get_json(force=True)
+    pattern = data.get("pattern", "000000")
+    if len(pattern) != 6 or not all(c in "01" for c in pattern):
+        return jsonify({"error": "pattern must be 6 binary chars"}), 400
+    _send_to_arduino(pattern)
+    # Pulse: bring all pins back down after 300 ms
+    threading.Timer(0.3, lambda: _send_to_arduino("000000")).start()
+    return jsonify({"ok": True, "pattern": pattern})
+
+@app.route("/api/arduino-status")
+def arduino_status():
+    ser = _get_serial()
+    return jsonify({"connected": ser is not None})
+
+# ── Webcam (external USB cam = index 1; change to 0 for built-in) ──
+WEBCAM_INDEX = 1
+_cap: cv2.VideoCapture | None = None
+_cap_lock = threading.Lock()
+
+
+def _get_cap() -> cv2.VideoCapture:
+    global _cap
+    if _cap is None or not _cap.isOpened():
+        _cap = cv2.VideoCapture(WEBCAM_INDEX)
+        if not _cap.isOpened():
+            _cap = cv2.VideoCapture(0)   # fallback to built-in
+    return _cap
+
+
+def _read_frame():
+    with _cap_lock:
+        cap = _get_cap()
+        ok, frame = cap.read()
+    return ok, frame if ok else None
+
+
+def _mjpeg_stream():
+    while True:
+        ok, frame = _read_frame()
+        if not ok:
+            continue
+        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" +
+            buf.tobytes() +
+            b"\r\n"
+        )
+
+
+@app.route("/api/video-feed")
+def video_feed():
+    return Response(_mjpeg_stream(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
 def extract_video_id(url: str) -> str | None:
@@ -44,10 +143,34 @@ def get_transcript():
 
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
-        raw = " ".join(item["text"] for item in transcript_list)
+        transcript = YouTubeTranscriptApi().fetch(video_id)
+        raw = " ".join(snippet.text for snippet in transcript)
         text = html_lib.unescape(raw)
         return jsonify({"text": text, "video_id": video_id})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/capture", methods=["POST"])
+def capture():
+    ok, frame = _read_frame()
+    if not ok or frame is None:
+        return jsonify({"error": "Could not read frame from webcam"}), 500
+    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    image_b64 = base64.b64encode(buf.tobytes()).decode()
+    try:
+        from google import genai
+        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[{
+                "parts": [
+                    {"text": "Extract ONLY the text visible in this image. Return just the raw text with no explanation. If no text is visible, return an empty string."},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}},
+                ]
+            }],
+        )
+        return jsonify({"text": (response.text or "").strip()})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 

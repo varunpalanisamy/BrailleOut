@@ -1,92 +1,126 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { BrailleDisplay } from '../components/BrailleDisplay';
-import { useLetterNav } from '../hooks/useLetterNav';
-import { parseSentenceToLetters } from '../data/braille';
+import { BRAILLE, dotsToBinary, getActiveDots } from '../data/braille';
 
 export function KeyboardPage() {
-  const [input, setInput] = useState('');
-  const [letters, setLetters] = useState<string[]>([]);
-  const [liveChar, setLiveChar] = useState('');
-  const [charFading, setCharFading] = useState(false);
-  const prevLive = useRef('');
-  const inputRef = useRef<HTMLTextAreaElement>(null);
-  const nav = useLetterNav(letters);
+  const [typed, setTyped] = useState('');
+  const [currentChar, setCurrentChar] = useState('');
+  const prevChar = useRef('');
 
-  // Real-time: track last typed char for big display
-  const handleInput = (val: string) => {
-    setInput(val);
-    const last = val.slice(-1);
-    if (last && last !== prevLive.current) {
-      setCharFading(true);
-      setTimeout(() => {
-        setLiveChar(last.toLowerCase());
-        setCharFading(false);
-        prevLive.current = last;
-      }, 100);
-    }
+  const activeDots = getActiveDots(currentChar);
+  const binaryPattern = dotsToBinary(activeDots);
+
+  const sendChar = useCallback((ch: string) => {
+    const dots = getActiveDots(ch);
+    const pattern = dotsToBinary(dots);
+    fetch('/api/send-pattern', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pattern }),
+    }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+      if (e.key === 'Backspace') {
+        setTyped((prev) => {
+          const next = prev.slice(0, -1);
+          const lastCh = next.slice(-1).toLowerCase();
+          if (lastCh && lastCh in BRAILLE) {
+            setCurrentChar(lastCh);
+            prevChar.current = lastCh;
+            sendChar(lastCh);
+          } else {
+            setCurrentChar('');
+            prevChar.current = '';
+          }
+          return next;
+        });
+        return;
+      }
+
+      const ch = e.key === ' ' ? ' ' : e.key.toLowerCase();
+      if (ch.length !== 1 || !(ch in BRAILLE)) return;
+      e.preventDefault();
+
+      setTyped((prev) => prev + ch);
+      setCurrentChar(ch);
+      prevChar.current = ch;
+      sendChar(ch);
+    };
+
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [sendChar]);
+
+  const clear = () => {
+    setTyped('');
+    setCurrentChar('');
+    prevChar.current = '';
   };
 
-  // Auto-focus input
-  useEffect(() => { inputRef.current?.focus(); }, []);
-
-  const startNav = () => {
-    const parsed = parseSentenceToLetters(input);
-    setLetters(parsed.length ? parsed : []);
-  };
+  const letters = currentChar ? [currentChar] : [];
 
   return (
     <div className="page-two-col">
       <div className="page-main">
         <div className="section-header">
           <div className="section-title">Keyboard → Braille</div>
-          <div className="section-sub">Type anything — see the Braille cell update live. Hit Navigate to step through letter by letter.</div>
+          <div className="section-sub">
+            Press any key (a–z or space) — the Braille cell updates instantly and drives the Arduino.
+          </div>
         </div>
 
-        {/* Live character display */}
-        {liveChar && (
-          <div className={`live-char-display card${charFading ? ' fading' : ''}`}>
-            {liveChar.toUpperCase()}
+        {/* Typed history */}
+        <div className="card kb-history">
+          {typed ? (
+            <div className="kb-typed-text">
+              {typed.split('').map((ch, i) => (
+                <span
+                  key={i}
+                  className={`kb-char${i === typed.length - 1 ? ' active' : ''}`}
+                >
+                  {ch === ' ' ? '·' : ch.toUpperCase()}
+                </span>
+              ))}
+            </div>
+          ) : (
+            <span className="kb-placeholder">Start typing — press any letter key…</span>
+          )}
+        </div>
+
+        {/* Big live letter */}
+        {currentChar && (
+          <div className="live-char-display card">
+            {currentChar === ' ' ? '·' : currentChar.toUpperCase()}
           </div>
         )}
 
-        {/* Input */}
-        <div className="kb-input-area">
-          <textarea
-            ref={inputRef}
-            className="kb-input"
-            value={input}
-            onChange={(e) => handleInput(e.target.value)}
-            placeholder="Start typing…"
-            spellCheck={false}
-            rows={3}
-          />
-          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-            <button
-              className="action-btn"
-              onClick={startNav}
-              disabled={!input.trim()}
-            >
-              Navigate letter by letter →
-            </button>
-            {letters.length > 0 && (
-              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-3)' }}>
-                {letters.length} letter{letters.length !== 1 ? 's' : ''}
-              </span>
-            )}
-          </div>
-        </div>
+        {typed && (
+          <button className="action-btn" onClick={clear} style={{ alignSelf: 'flex-start' }}>
+            Clear
+          </button>
+        )}
       </div>
 
       <div className="page-sidebar">
-        {letters.length > 0
-          ? <BrailleDisplay {...nav} letters={letters} />
-          : (
-            <div className="card" style={{ display: 'flex', flexDirection: 'column', gap: 10, alignItems: 'center', padding: 32, textAlign: 'center' }}>
-              <span style={{ fontSize: 32 }}>⌨</span>
-              <span style={{ color: 'var(--text-3)', fontSize: 13 }}>Type something and click Navigate</span>
-            </div>
-          )
-        }
+        <BrailleDisplay
+          currentChar={currentChar}
+          activeDots={activeDots}
+          binaryPattern={binaryPattern}
+          currentIndex={0}
+          letters={letters}
+          next={() => {}}
+          prev={() => {}}
+          canNext={false}
+          canPrev={false}
+          isAuto={false}
+          speed={1}
+          setSpeed={() => {}}
+          toggleAuto={() => {}}
+        />
       </div>
     </div>
   );
