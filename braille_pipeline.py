@@ -51,7 +51,7 @@ GEMINI_VISION_MODEL = "gemini-2.5-flash"
 SERIAL_PORT         = "/dev/cu.usbmodem1051DB2BD6802"     # change to match your Arduino
 SERIAL_BAUD         = 9600
 CLAUDE_MODEL        = "claude-sonnet-4-6"
-WEBCAM_INDEX        = 0
+WEBCAM_INDEX        = 1                   # external USB webcam (0 = built-in, never use)
 
 SYSTEM_PROMPT = (
     "You are a text cleanup assistant. The user will send you raw OCR text "
@@ -95,7 +95,7 @@ CAM_H = 360
 # Physical servo order matches left→right, top→bottom wiring:
 # servo0=top-left(dot1), servo1=top-right(dot4), servo2=mid-left(dot2),
 # servo3=mid-right(dot5), servo4=bot-left(dot3), servo5=bot-right(dot6)
-_SERVO_DOT_ORDER = [1, 4, 2, 5, 3, 6]
+_SERVO_DOT_ORDER = [1, 2, 3, 4, 5, 6]  # sequential: servo 0→dot1, 1→dot2, 2→dot3, 3→dot4, 4→dot5, 5→dot6
 
 def dots_to_pattern(dots: list[int]) -> str:
     return ''.join('1' if d in dots else '0' for d in _SERVO_DOT_ORDER)

@@ -1,3 +1,4 @@
+# macOS only (Homebrew): brew install python-tk@3.13
 anthropic==0.100.0
 google-genai==2.0.1
 opencv-python==4.13.0.92

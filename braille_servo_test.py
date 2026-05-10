@@ -48,7 +48,7 @@ BRAILLE: dict[str, list[int]] = {
 # Servos are wired left→right, top→bottom: positions 1,2,3,4,5,6
 # Braille dots run down left column then right: dot1=top-left, dot4=top-right,
 #   dot2=mid-left, dot5=mid-right, dot3=bot-left, dot6=bot-right
-_SERVO_DOT_ORDER = [1, 4, 2, 5, 3, 6]
+_SERVO_DOT_ORDER = [1, 2, 3, 4, 5, 6]  # sequential: servo 0→dot1, 1→dot2, 2→dot3, 3→dot4, 4→dot5, 5→dot6
 
 # Braille dot → which servo circle to light (for the on-screen display)
 # dot1→circle1, dot2→circle3, dot3→circle5, dot4→circle2, dot5→circle4, dot6→circle6

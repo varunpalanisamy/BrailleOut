@@ -76,8 +76,8 @@ def arduino_status():
     ser = _get_serial()
     return jsonify({"connected": ser is not None})
 
-# ── Webcam (external USB cam = index 1; change to 0 for built-in) ──
-WEBCAM_INDEX = 1
+# ── Webcam ──────────────────────────────────────────────────────────────────
+_webcam_index = 1  # default to external USB cam
 _cap: cv2.VideoCapture | None = None
 _cap_lock = threading.Lock()
 
@@ -85,10 +85,18 @@ _cap_lock = threading.Lock()
 def _get_cap() -> cv2.VideoCapture:
     global _cap
     if _cap is None or not _cap.isOpened():
-        _cap = cv2.VideoCapture(WEBCAM_INDEX)
-        if not _cap.isOpened():
-            _cap = cv2.VideoCapture(0)   # fallback to built-in
+        _cap = cv2.VideoCapture(_webcam_index)
     return _cap
+
+
+def _release_cap():
+    global _cap
+    if _cap is not None:
+        try:
+            _cap.release()
+        except Exception:
+            pass
+        _cap = None
 
 
 def _read_frame():
@@ -102,6 +110,7 @@ def _mjpeg_stream():
     while True:
         ok, frame = _read_frame()
         if not ok:
+            time.sleep(0.05)
             continue
         _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
         yield (
@@ -115,6 +124,35 @@ def _mjpeg_stream():
 @app.route("/api/video-feed")
 def video_feed():
     return Response(_mjpeg_stream(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.route("/api/cameras")
+def list_cameras():
+    """Probe indices 0-4 and return which ones open successfully."""
+    available = []
+    for i in range(5):
+        # Skip the currently open cap to avoid conflict
+        if i == _webcam_index and _cap is not None and _cap.isOpened():
+            available.append({"index": i, "label": f"Camera {i}{' (built-in)' if i == 0 else ''}"})
+            continue
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            available.append({"index": i, "label": f"Camera {i}{' (built-in)' if i == 0 else ''}"})
+            cap.release()
+    return jsonify({"cameras": available, "active": _webcam_index})
+
+
+@app.route("/api/set-camera", methods=["POST"])
+def set_camera():
+    global _webcam_index
+    data = request.get_json(force=True)
+    idx = data.get("index")
+    if not isinstance(idx, int):
+        return jsonify({"error": "index must be an integer"}), 400
+    with _cap_lock:
+        _release_cap()
+        _webcam_index = idx
+    return jsonify({"ok": True, "active": _webcam_index})
 
 
 def extract_video_id(url: str) -> str | None:
