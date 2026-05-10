@@ -872,7 +872,7 @@ html, body, #root {
   border: 1px solid var(--border-bright);
   border-radius: var(--r-md);
   padding: 16px 18px;
-  max-height: 220px;
+  max-height: 380px;
   overflow-y: auto;
   word-break: break-word;
   box-shadow: 0 1px 6px rgba(124,58,237,0.06);
@@ -888,7 +888,7 @@ html, body, #root {
 
 .yt-thumbnail {
   border-radius: var(--r-md);
-  width: 100%;
+  width: 160px;
   aspect-ratio: 16/9;
   object-fit: cover;
   border: 1px solid var(--border-bright);

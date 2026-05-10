@@ -12,9 +12,11 @@ interface Props {
   canNext: boolean;
   canPrev: boolean;
   isAuto: boolean;
+  isRepeat: boolean;
   speed: number;
   setSpeed: (s: number) => void;
   toggleAuto: () => void;
+  toggleRepeat: () => void;
 }
 
 // SVG geometry — matches .bd-svg 180×270
@@ -31,7 +33,7 @@ export function BrailleDisplay({
   currentChar, activeDots, binaryPattern,
   currentIndex, letters,
   next, prev, canNext, canPrev,
-  isAuto, speed, setSpeed, toggleAuto,
+  isAuto, isRepeat, speed, setSpeed, toggleAuto, toggleRepeat,
 }: Props) {
   const total = letters.length;
   const [fading, setFading] = useState(false);
@@ -126,6 +128,13 @@ export function BrailleDisplay({
             disabled={letters.length === 0}
           >
             {isAuto ? '⏹ Stop' : '▶ Auto'}
+          </button>
+          <button
+            className={`auto-btn${isRepeat ? ' active' : ''}`}
+            onClick={toggleRepeat}
+            title="Loop through letters continuously"
+          >
+            {isRepeat ? '🔁 Repeat On' : '🔁 Repeat'}
           </button>
           <div className="speed-row">
             <span className="speed-label">0.3s</span>
