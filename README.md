@@ -4,6 +4,20 @@ A physical assistive device that reads real-world text through a webcam, process
 
 ---
 
+## Images
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/3e99b283-588e-4927-b53b-b73a82a5d44b" width="300" />
+  <img src="https://github.com/user-attachments/assets/96bac622-504a-4019-b788-d26084b8f8d5" width="500" />
+</p>
+
+
+
+| ![Underneath the Braille table](https://github.com/user-attachments/assets/630b9906-6fc6-4bc3-983f-a83d06162c6b) | ![Top view of Braille Table](https://github.com/user-attachments/assets/c158f615-d1e1-42b4-b6a4-e974968ffeb9) | ![Arduino and Base Studio](https://github.com/user-attachments/assets/ddee993b-5c24-40fa-bb29-e56fe5d9a45e) |
+| :---: | :---: | :---: |
+| Underneath the Braille table with 6 servo motors | Top view of Braille Table | Arduino and Base Studio with jumper wires |
+
+
 ## How It Works
 
 ```
