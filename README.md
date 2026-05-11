@@ -1,4 +1,5 @@
-# AI-Powered Braille Display — HackDavis 2026
+# AI-Powered Braille Display
+## 2nd Place Overall & 1st Place for Use of DAC Materials(Computer Vision AI pipeline) @ HackDavis 2026 
 
 A physical assistive device that reads real-world text through a webcam, processes it with AI, and outputs it in Grade 1 Braille — both on screen and physically via 6 servo motors that raise and lower pins.
 
