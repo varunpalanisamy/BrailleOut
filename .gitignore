@@ -5,3 +5,5 @@ web/dist/
 web/node_modules/
 myenv/
 .DS_Store
+web/.vite
+cookies.txt

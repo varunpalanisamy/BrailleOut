@@ -109,13 +109,17 @@ def _read_frame():
 @app.route("/api/cameras")
 def list_cameras():
     available = []
-    for i in range(5):
+    for i in range(10):
         if i == _webcam_index and _cap is not None and _cap.isOpened():
-            available.append({"index": i, "label": f"Camera {i}{' (built-in)' if i == 0 else ' (external)'}"})
+            label = "Built-in" if i == 0 else f"Camera {i}"
+            available.append({"index": i, "label": label})
             continue
-        cap = cv2.VideoCapture(i)
+        cap = cv2.VideoCapture(i, cv2.CAP_AVFOUNDATION)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(i)
         if cap.isOpened():
-            available.append({"index": i, "label": f"Camera {i}{' (built-in)' if i == 0 else ' (external)'}"})
+            label = "Built-in" if i == 0 else f"Camera {i}"
+            available.append({"index": i, "label": label})
             cap.release()
     return jsonify({"cameras": available, "active": _webcam_index})
 
@@ -179,9 +183,18 @@ def get_transcript():
         return jsonify({"error": "Could not extract video ID — paste the full YouTube URL"}), 400
 
     try:
+        import http.cookiejar
+        import requests as req_mod
         from youtube_transcript_api import YouTubeTranscriptApi
-        cookies_path = os.path.join(os.path.dirname(__file__), "cookies.txt")
-        api = YouTubeTranscriptApi(cookies=cookies_path) if os.path.exists(cookies_path) else YouTubeTranscriptApi()
+        cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+        if os.path.exists(cookies_path):
+            session = req_mod.Session()
+            jar = http.cookiejar.MozillaCookieJar(cookies_path)
+            jar.load(ignore_discard=True, ignore_expires=True)
+            session.cookies = jar
+            api = YouTubeTranscriptApi(http_client=session)
+        else:
+            api = YouTubeTranscriptApi()
         transcript = api.fetch(video_id)
         raw = " ".join(snippet.text for snippet in transcript)
         text = html_lib.unescape(raw)
@@ -189,7 +202,7 @@ def get_transcript():
     except Exception as exc:
         msg = str(exc)
         if "blocked" in msg.lower() or "ip" in msg.lower():
-            return jsonify({"error": "YouTube blocked this request. Add a cookies.txt file to the project root to fix this — see the YouTube tab for instructions."}), 500
+            return jsonify({"error": "Your IP is temporarily blocked by YouTube. Switch to a different network (e.g. phone hotspot) and try again."}), 500
         return jsonify({"error": msg}), 500
 
 
