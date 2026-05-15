@@ -9,6 +9,8 @@ interface CameraOption {
   label: string;
 }
 
+type ScanPhase = 'idle' | 'snapping' | 'processing' | 'done' | 'error';
+
 export function CameraPage() {
   const { streamUrl } = useWebcam();
   const [letters, setLetters] = useState<string[]>([]);
@@ -18,6 +20,8 @@ export function CameraPage() {
   const [streamError, setStreamError] = useState(false);
   const [streamKey, setStreamKey] = useState(0);
   const [isLive, setIsLive] = useState(false);
+  const [scanPhase, setScanPhase] = useState<ScanPhase>('idle');
+  const [thumbnail, setThumbnail] = useState<string>('');
   const lastTextRef = useRef('');
 
   const [cameras, setCameras] = useState<CameraOption[]>([]);
@@ -62,12 +66,27 @@ export function CameraPage() {
     if (processing) return;
     setProcessing(true);
     setApiError('');
+
     try {
-      const res = await fetch('/api/capture', { method: 'POST' });
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-      const text = data.text || '';
+      // Step 1: grab frame instantly
+      setScanPhase('snapping');
+      const snapRes = await fetch('/api/snap', { method: 'POST' });
+      const snapData = await snapRes.json();
+      if (snapData.error) throw new Error(snapData.error);
+      setThumbnail(snapData.thumbnail);
+
+      // Frame is captured — user can put the sign down
+      setScanPhase('processing');
+
+      // Step 2: run Gemma (slow — 10-40s)
+      const gemmaRes = await fetch('/api/gemma-process', { method: 'POST' });
+      const gemmaData = await gemmaRes.json();
+      if (gemmaData.error) throw new Error(gemmaData.error);
+
+      const text = gemmaData.text || '';
       setOcrText(text);
+      setScanPhase('done');
+
       if (text !== lastTextRef.current) {
         lastTextRef.current = text;
         const parsed = parseSentenceToLetters(text);
@@ -76,6 +95,7 @@ export function CameraPage() {
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       setApiError(msg.includes('fetch') ? 'Backend not running — start api_server.py' : msg);
+      setScanPhase('error');
     } finally {
       setProcessing(false);
     }
@@ -85,7 +105,7 @@ export function CameraPage() {
   useEffect(() => {
     if (!isLive) return;
     captureOnce();
-    const id = setInterval(captureOnce, 2500);
+    const id = setInterval(captureOnce, 8000);
     return () => clearInterval(id);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLive]);
@@ -163,18 +183,48 @@ export function CameraPage() {
           onClick={() => setIsLive(v => !v)}
           disabled={streamError}
         >
-          {isLive
-            ? (processing ? '⏳ Scanning…' : '⏹ Stop Live')
-            : '▶ Live'}
+          {isLive ? '⏹ Stop Live' : '▶ Live'}
         </button>
 
-        {/* OCR result */}
-        {(ocrText || apiError) && (
+        {/* Status banner */}
+        {isLive && (
+          <div className="scan-status-banner" data-phase={scanPhase}>
+            {scanPhase === 'idle' && (
+              <span>Hold text up to camera — scanning starts automatically.</span>
+            )}
+            {scanPhase === 'snapping' && (
+              <span>📸 Capturing frame…</span>
+            )}
+            {scanPhase === 'processing' && (
+              <>
+                <span className="scan-spinner" />
+                <span>
+                  <strong>Frame captured — you can put the sign down.</strong>
+                  <br />Gemma 4 is analyzing… this takes 10–40 seconds.
+                </span>
+                {thumbnail && (
+                  <img
+                    src={`data:image/jpeg;base64,${thumbnail}`}
+                    alt="Captured frame"
+                    className="scan-thumbnail"
+                  />
+                )}
+              </>
+            )}
+            {scanPhase === 'done' && (
+              <span>✅ Done — next scan in a few seconds.</span>
+            )}
+            {scanPhase === 'error' && (
+              <span style={{ color: 'var(--error)' }}>⚠ {apiError}</span>
+            )}
+          </div>
+        )}
+
+        {/* Gemma result */}
+        {ocrText && (
           <div className="ocr-result">
-            <span className="ocr-label">{apiError ? 'Error' : 'Detected text'}</span>
-            <span style={{ color: apiError ? 'var(--error)' : 'inherit' }}>
-              {apiError || ocrText || '(no text detected)'}
-            </span>
+            <span className="ocr-label">Gemma 4 →</span>
+            <span>{ocrText}</span>
           </div>
         )}
       </div>
