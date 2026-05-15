@@ -77,7 +77,19 @@ def arduino_status():
     return jsonify({"connected": ser is not None})
 
 # ── Webcam ──────────────────────────────────────────────────────────────────
-_webcam_index = 1  # default to external USB cam (index 1)
+def _autodetect_camera() -> int:
+    for i in range(5):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            ok, _ = cap.read()
+            cap.release()
+            if ok:
+                print(f"[Camera] Auto-detected camera at index {i}")
+                return i
+    print("[Camera] No camera detected — defaulting to index 0")
+    return 0
+
+_webcam_index = _autodetect_camera()
 _cap: cv2.VideoCapture | None = None
 _cap_lock = threading.Lock()
 
@@ -264,6 +276,88 @@ def process_image():
             ],
         )
         return jsonify({"text": (response.text or "").strip()})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+_last_snap: bytes | None = None
+_last_snap_lock = threading.Lock()
+
+_GEMMA_SYSTEM = (
+    "You are an intelligent interpreter for a deaf-blind braille reader. "
+    "You receive camera images from their environment. "
+    "Distill the most important information into AT MOST 5 words. "
+    "Output ONLY the phrase — no explanation, no punctuation except spaces, lowercase only. "
+    "If nothing meaningful is visible, output: nothing detected"
+)
+
+@app.route("/api/snap", methods=["POST"])
+def snap():
+    """Step 1: grab a frame instantly and store it. Returns a thumbnail so the
+    frontend can show a preview while Gemma processes in the background."""
+    global _last_snap
+    ok, frame = _read_frame()
+    if not ok or frame is None:
+        return jsonify({"error": "Could not read frame from webcam"}), 500
+    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    with _last_snap_lock:
+        _last_snap = buf.tobytes()
+    thumbnail = base64.b64encode(_last_snap).decode()
+    return jsonify({"ok": True, "thumbnail": thumbnail})
+
+
+@app.route("/api/gemma-process", methods=["POST"])
+def gemma_process():
+    """Step 2: run Gemma 4 on the last snapped frame. Takes 10-40s."""
+    with _last_snap_lock:
+        snap_bytes = _last_snap
+    if snap_bytes is None:
+        return jsonify({"error": "No frame snapped yet — call /api/snap first"}), 400
+    image_b64 = base64.b64encode(snap_bytes).decode()
+    try:
+        import ollama
+        resp = ollama.chat(
+            model="gemma4:e4b",
+            messages=[
+                {"role": "system", "content": _GEMMA_SYSTEM},
+                {
+                    "role": "user",
+                    "content": "What is the most important information in this image? 5 words or fewer.",
+                    "images": [image_b64],
+                },
+            ],
+            options={"temperature": 0.1, "num_predict": 30},
+        )
+        text = resp["message"]["content"].strip().lower().rstrip(".,!?;:\"'").strip()
+        return jsonify({"text": text})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/gemma-capture", methods=["POST"])
+def gemma_capture():
+    """Legacy single-step endpoint (kept for compatibility)."""
+    ok, frame = _read_frame()
+    if not ok or frame is None:
+        return jsonify({"error": "Could not read frame from webcam"}), 500
+    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    image_b64 = base64.b64encode(buf.tobytes()).decode()
+    try:
+        import ollama
+        resp = ollama.chat(
+            model="gemma4:e4b",
+            messages=[
+                {"role": "system", "content": _GEMMA_SYSTEM},
+                {
+                    "role": "user",
+                    "content": "What is the most important information in this image? 5 words or fewer.",
+                    "images": [image_b64],
+                },
+            ],
+            options={"temperature": 0.1, "num_predict": 30},
+        )
+        text = resp["message"]["content"].strip().lower().rstrip(".,!?;:\"'").strip()
+        return jsonify({"text": text})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
