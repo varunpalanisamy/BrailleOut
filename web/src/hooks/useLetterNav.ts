@@ -5,9 +5,10 @@ export function useLetterNav(letters: string[], suggestedDelay?: number) {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isAuto, setIsAuto] = useState(false);
   const [isRepeat, setIsRepeat] = useState(false);
-  const [speed, setSpeed] = useState(1.5); // seconds between letters, minimum 0.3
+  const [speed, setSpeed] = useState(1.0); // seconds between letters, minimum 0.3
   const autoRef = useRef(isAuto);
   const speedRef = useRef(speed);
+  const prevJoinRef = useRef('');
   autoRef.current = isAuto;
   speedRef.current = speed;
 
@@ -39,10 +40,16 @@ export function useLetterNav(letters: string[], suggestedDelay?: number) {
     return () => window.removeEventListener('keydown', handler);
   }, [next, prev]);
 
-  // reset to start and stop auto if letters array changes
+  // Smart reset: only reset if letters changed non-append (queue accumulation keeps position)
   useEffect(() => {
-    setCurrentIndex(0);
-    setIsAuto(false);
+    const newJoin = letters.join('');
+    const prevJoin = prevJoinRef.current;
+    if (newJoin === '' || !newJoin.startsWith(prevJoin)) {
+      setCurrentIndex(0);
+      setIsAuto(false);
+    }
+    prevJoinRef.current = newJoin;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [letters.join('')]);
 
   // seed pacing speed from Gemma's content-type suggestion

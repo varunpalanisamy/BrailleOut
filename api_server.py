@@ -5,6 +5,13 @@ Runs on port 5001 so it doesn't conflict with anything else.
 """
 
 import os
+# Must be set before torch / whisper / opencv import to prevent semaphore leaks
+# and segfaults caused by PyTorch's internal thread pools colliding with Flask threads.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import re
 import json
 import base64
@@ -23,30 +30,49 @@ app = Flask(__name__)
 CORS(app)
 
 # ── Arduino serial ──────────────────────────────────────────────
-SERIAL_PORT = "/dev/cu.usbmodem1051DB2BD6802"
 SERIAL_BAUD = 9600
 _ser = None
 _ser_lock = threading.Lock()
+_serial_warned = False
 
 try:
     import serial as _serial_mod
+    from serial.tools import list_ports as _list_ports
     _SERIAL_LIB = True
 except ImportError:
     _SERIAL_LIB = False
     print("[Serial] pyserial not installed — Arduino output disabled")
 
+def _find_arduino_port() -> str | None:
+    """Return the first port that looks like an Arduino, or None."""
+    for port in _list_ports.comports():
+        desc = (port.description or '').lower()
+        mfr  = (port.manufacturer or '').lower()
+        if any(k in desc or k in mfr for k in ('arduino', 'usbmodem', 'ch340', 'cp210', 'ftdi')):
+            return port.device
+    return None
+
 def _get_serial():
-    global _ser
+    global _ser, _serial_warned
     if not _SERIAL_LIB:
         return None
     with _ser_lock:
         if _ser is None or not _ser.isOpen():
+            port = _find_arduino_port()
+            if port is None:
+                if not _serial_warned:
+                    print("[Serial] No Arduino found — braille hardware disabled")
+                    _serial_warned = True
+                return None
             try:
-                _ser = _serial_mod.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
+                _ser = _serial_mod.Serial(port, SERIAL_BAUD, timeout=1)
                 time.sleep(2)
-                print(f"[Serial] Connected: {SERIAL_PORT}")
+                _serial_warned = False
+                print(f"[Serial] Connected: {port}")
             except Exception as e:
-                print(f"[Serial] Could not connect: {e}")
+                if not _serial_warned:
+                    print(f"[Serial] Could not connect to {port}: {e}")
+                    _serial_warned = True
                 _ser = None
     return _ser
 
@@ -79,15 +105,30 @@ def arduino_status():
     return jsonify({"connected": ser is not None})
 
 # ── Webcam ──────────────────────────────────────────────────────────────────
+import contextlib
+
+@contextlib.contextmanager
+def _silence_cv():
+    """Redirect stderr at the fd level to suppress OpenCV's probe warnings."""
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    saved = os.dup(2)
+    try:
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        os.close(devnull_fd)
+
 def _autodetect_camera() -> int:
     for i in range(5):
-        cap = cv2.VideoCapture(i)
-        if cap.isOpened():
-            ok, _ = cap.read()
+        with _silence_cv():
+            cap = cv2.VideoCapture(i)
+            ok, _ = cap.read() if cap.isOpened() else (False, None)
             cap.release()
-            if ok:
-                print(f"[Camera] Auto-detected camera at index {i}")
-                return i
+        if ok:
+            print(f"[Camera] Auto-detected camera at index {i}")
+            return i
     print("[Camera] No camera detected — defaulting to index 0")
     return 0
 
@@ -128,13 +169,17 @@ def list_cameras():
             label = "Built-in" if i == 0 else f"Camera {i}"
             available.append({"index": i, "label": label})
             continue
-        cap = cv2.VideoCapture(i, cv2.CAP_AVFOUNDATION)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(i)
-        if cap.isOpened():
+        with _silence_cv():
+            cap = cv2.VideoCapture(i, cv2.CAP_AVFOUNDATION)
+            opened = cap.isOpened()
+            if not opened:
+                cap.release()
+                cap = cv2.VideoCapture(i)
+                opened = cap.isOpened()
+            cap.release()
+        if opened:
             label = "Built-in" if i == 0 else f"Camera {i}"
             available.append({"index": i, "label": label})
-            cap.release()
     return jsonify({"cameras": available, "active": _webcam_index})
 
 
@@ -289,52 +334,40 @@ _last_snap_lock = threading.Lock()
 _frame_history: collections.deque = collections.deque(maxlen=3)
 _frame_history_lock = threading.Lock()
 
-# ── Whisper (lazy-loaded on first /api/transcribe call) ──────────
-_whisper_instance = None
-_whisper_lock = threading.Lock()
-_WHISPER_MODEL = "base"
-
-def _load_whisper():
-    global _whisper_instance
-    if _whisper_instance is not None:
-        return _whisper_instance
-    with _whisper_lock:
-        if _whisper_instance is None:
-            try:
-                import whisper as _whisper_mod
-                print(f"[Whisper] Loading '{_WHISPER_MODEL}' model…")
-                _whisper_instance = _whisper_mod.load_model(_WHISPER_MODEL)
-                print("[Whisper] Model ready.")
-            except ImportError:
-                print("[Whisper] openai-whisper not installed.")
-                _whisper_instance = None
-    return _whisper_instance
+# Stop retrying the minimal prompt after 3 consecutive empty responses
+_empty_streak = 0
+_MAX_RETRY_STREAK = 3
 
 # ── Gemma system prompt + mode parsing ──────────────────────────
-_GEMMA_SYSTEM = (
-    "You are an intelligent interpreter for a deaf-blind braille reader. "
-    "You receive camera images from their environment. "
-    "Choose exactly ONE mode tag based on what you see, then give a short phrase:\n"
-    "  [TEXT] — if text, signs, labels, or written words are visible: extract the text\n"
-    "  [SCENE] — if it is an environment or scene with no prominent text: describe in 5 words or fewer\n"
-    "  [PERSON] — if a person is the main subject: describe them in 5 words or fewer\n"
-    "Output format: [TAG] phrase — lowercase, no punctuation except spaces, AT MOST 5 words after the tag. "
-    "Examples: '[TEXT] stop', '[SCENE] busy street corner', '[PERSON] someone waving'. "
-    "If nothing meaningful is visible, output: [SCENE] nothing detected"
-)
+_GEMMA_SYSTEM = ""  # instructions folded into the user turn for better compliance
 
 _MODE_DELAYS = {"TEXT": 1.5, "SCENE": 0.8, "PERSON": 1.2}
 
+_MODE_FALLBACKS = {"TEXT": "text visible", "SCENE": "scene ahead", "PERSON": "person present"}
+
 def _parse_gemma_output(raw: str):
     """Return (mode, clean_text, delay) from Gemma's tagged output."""
-    text = raw.strip().lower()
-    m = re.match(r'^\[(text|scene|person)\]\s*', text)
+    text = raw.strip()
+    # Primary: colon format "scene: busy coffee shop"
+    m = re.search(r'\b(text|scene|person)\s*:\s*([^\n]+)', text, re.IGNORECASE)
     if m:
         mode = m.group(1).upper()
-        clean = text[m.end():].strip().rstrip(".,!?;:\"'")
+        desc = m.group(2).strip().rstrip(".,!?;:\"'").lower()
+        clean = ' '.join(desc.split()[:8])
     else:
-        mode = "SCENE"
-        clean = text.rstrip(".,!?;:\"'").strip()
+        # Fallback: bracket format "[SCENE] something"
+        m2 = re.search(r'\[(text|scene|person)\]\s*([^\n]*)', text, re.IGNORECASE)
+        if m2:
+            mode = m2.group(1).upper()
+            desc = m2.group(2).strip().rstrip(".,!?;:\"'").lower()
+            clean = ' '.join(desc.split()[:8])
+        else:
+            # No recognised format — use the first line verbatim (better than canned phrase)
+            mode = "SCENE"
+            first_line = text.split('\n')[0].strip().rstrip(".,!?;:\"'").lower()
+            clean = ' '.join(first_line.split()[:8])
+    if not clean:
+        clean = _MODE_FALLBACKS.get(mode, "nothing detected")
     return mode, clean, _MODE_DELAYS.get(mode, 1.5)
 
 @app.route("/api/snap", methods=["POST"])
@@ -345,7 +378,7 @@ def snap():
     ok, frame = _read_frame()
     if not ok or frame is None:
         return jsonify({"error": "Could not read frame from webcam"}), 500
-    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
     with _last_snap_lock:
         _last_snap = buf.tobytes()
     thumbnail = base64.b64encode(_last_snap).decode()
@@ -361,58 +394,80 @@ def gemma_stream():
     with mode (TEXT/SCENE/PERSON), clean text, and suggested pacing delay.
     """
     body = request.get_json(force=True, silent=True) or {}
-    audio_transcript = (body.get("audio_transcript") or "").strip()
 
-    with _last_snap_lock:
-        snap_bytes = _last_snap
-    if snap_bytes is None:
-        def _err():
-            yield "data: " + json.dumps({"error": "No frame snapped yet — call /api/snap first"}) + "\n\n"
-        return Response(stream_with_context(_err()), mimetype="text/event-stream")
-
-    image_b64 = base64.b64encode(snap_bytes).decode()
+    image_b64 = (body.get("image_b64") or "").strip()
+    if not image_b64:
+        with _last_snap_lock:
+            snap_bytes = _last_snap
+        if snap_bytes is None:
+            def _err():
+                yield "data: " + json.dumps({"error": "No frame snapped yet — call /api/snap first"}) + "\n\n"
+            return Response(stream_with_context(_err()), mimetype="text/event-stream")
+        image_b64 = base64.b64encode(snap_bytes).decode()
 
     with _frame_history_lock:
         history_list = list(_frame_history)
 
-    history_prefix = ""
+    user_content = (
+        "Describe the most important thing in this image using exactly one of these:\n"
+        "  text: <quote the words exactly> — use when readable text or signs are visible\n"
+        "  person: <3-5 word description> — use when a person is the main subject\n"
+        "  scene: <3-5 word description> — use for everything else\n"
+        "Choose whichever fits best. Examples:\n"
+        "  'text: stop'  'text: push to open'  'person: woman smiling'  'scene: kitchen counter'\n"
+        "One line only. Never leave the description blank."
+    )
     if history_list:
-        prev_str = ", ".join(f"'{h}'" for h in history_list)
-        history_prefix = f"Previously seen: {prev_str}. Now: "
-
-    if audio_transcript:
-        user_content = (
-            f"{history_prefix}Someone nearby said: \"{audio_transcript}\". "
-            "What is the single most important information combining audio and image? "
-            "Reply with [TEXT], [SCENE], or [PERSON] tag followed by 5 words or fewer."
-        )
-    else:
-        user_content = (
-            f"{history_prefix}What is the most important information in this image? "
-            "Reply with [TEXT], [SCENE], or [PERSON] tag followed by 5 words or fewer."
-        )
+        prev_str = ", ".join(f"'{h}'" for h in history_list[-2:])
+        user_content += f"\nContext — previously seen: {prev_str}."
 
     def _generate():
         import ollama
         full_text = ""
         try:
+            messages = []
+            if _GEMMA_SYSTEM:
+                messages.append({"role": "system", "content": _GEMMA_SYSTEM})
+            messages.append({"role": "user", "content": user_content, "images": [image_b64]})
             stream = ollama.chat(
                 model="gemma4:e4b",
-                messages=[
-                    {"role": "system", "content": _GEMMA_SYSTEM},
-                    {"role": "user", "content": user_content, "images": [image_b64]},
-                ],
+                messages=messages,
                 stream=True,
-                options={"temperature": 0.1, "num_predict": 30},
+                options={"temperature": 0.1, "num_predict": 60},
             )
             for chunk in stream:
                 token = chunk["message"]["content"]
                 full_text += token
                 yield "data: " + json.dumps({"token": token}) + "\n\n"
 
+            print(f"[Gemma] raw output: {repr(full_text)}")
+
+            # Empty response — retry once with a simpler prompt, unless we've
+            # had too many consecutive empties (dark room / bad lighting).
+            global _empty_streak
+            if not full_text.strip():
+                if _empty_streak < _MAX_RETRY_STREAK:
+                    print(f"[Gemma] Empty (streak {_empty_streak + 1}) — retrying with minimal prompt…")
+                    try:
+                        retry = ollama.chat(
+                            model="gemma4:e4b",
+                            messages=[{"role": "user", "content": "Is there any text in this image? If yes, say 'text:' then quote it. Otherwise describe in 5 words.", "images": [image_b64]}],
+                            options={"temperature": 0.3, "num_predict": 30},
+                        )
+                        full_text = retry["message"]["content"]
+                        print(f"[Gemma] retry output: {repr(full_text)}")
+                    except Exception:
+                        pass
+                else:
+                    print(f"[Gemma] Empty streak {_empty_streak} — skipping retry")
+                _empty_streak += 1
+            else:
+                _empty_streak = 0  # reset on any successful response
+
             mode, clean_text, delay = _parse_gemma_output(full_text)
             with _frame_history_lock:
-                _frame_history.append(clean_text)
+                if clean_text and clean_text not in _MODE_FALLBACKS.values():
+                    _frame_history.append(clean_text)
 
             yield "data: " + json.dumps({
                 "done": True,
@@ -454,7 +509,8 @@ def gemma_process():
         )
         mode, clean_text, delay = _parse_gemma_output(resp["message"]["content"])
         with _frame_history_lock:
-            _frame_history.append(clean_text)
+            if clean_text and clean_text not in _MODE_FALLBACKS.values():
+                _frame_history.append(clean_text)
         return jsonify({"text": clean_text, "mode": mode, "delay": delay})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
@@ -488,42 +544,8 @@ def gemma_capture():
         return jsonify({"error": str(exc)}), 500
 
 
-@app.route("/api/transcribe", methods=["POST"])
-def transcribe_audio():
-    """
-    Accepts multipart/form-data with field 'audio' (webm/ogg blob from MediaRecorder).
-    Runs Whisper locally and returns { transcript: "..." }.
-    Requires ffmpeg in PATH for webm decoding.
-    """
-    import tempfile
-
-    if "audio" not in request.files:
-        return jsonify({"error": "No audio file in request"}), 400
-
-    model = _load_whisper()
-    if model is None:
-        return jsonify({"error": "Whisper not available — install openai-whisper"}), 503
-
-    audio_file = request.files["audio"]
-    suffix = ".webm"
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            audio_file.save(tmp.name)
-            tmp_path = tmp.name
-        result = model.transcribe(tmp_path, fp16=False, language="en")
-        transcript = result.get("text", "").strip()
-        return jsonify({"transcript": transcript})
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
-    finally:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
 
 
 if __name__ == "__main__":
     print("Starting Braille API server on http://localhost:5001")
-    app.run(port=5001, debug=True)
+    app.run(port=5001, debug=True, use_reloader=False, threaded=True)
