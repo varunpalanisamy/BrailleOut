@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { dotsToBinary, getActiveDots } from '../data/braille';
 
-export function useLetterNav(letters: string[]) {
+export function useLetterNav(letters: string[], suggestedDelay?: number) {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isAuto, setIsAuto] = useState(false);
   const [isRepeat, setIsRepeat] = useState(false);
@@ -44,6 +44,14 @@ export function useLetterNav(letters: string[]) {
     setCurrentIndex(0);
     setIsAuto(false);
   }, [letters.join('')]);
+
+  // seed pacing speed from Gemma's content-type suggestion
+  useEffect(() => {
+    if (suggestedDelay !== undefined) {
+      setSpeed(suggestedDelay);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [suggestedDelay]);
 
   // auto-advance loop
   useEffect(() => {

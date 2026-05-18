@@ -6,12 +6,14 @@ Runs on port 5001 so it doesn't conflict with anything else.
 
 import os
 import re
+import json
 import base64
+import collections
 import html as html_lib
 import threading
 import time
 import cv2
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request, Response, stream_with_context
 from flask_cors import CORS
 from dotenv import load_dotenv
 
@@ -283,13 +285,57 @@ def process_image():
 _last_snap: bytes | None = None
 _last_snap_lock = threading.Lock()
 
+# ── Temporal memory (last 3 Gemma summaries) ────────────────────
+_frame_history: collections.deque = collections.deque(maxlen=3)
+_frame_history_lock = threading.Lock()
+
+# ── Whisper (lazy-loaded on first /api/transcribe call) ──────────
+_whisper_instance = None
+_whisper_lock = threading.Lock()
+_WHISPER_MODEL = "base"
+
+def _load_whisper():
+    global _whisper_instance
+    if _whisper_instance is not None:
+        return _whisper_instance
+    with _whisper_lock:
+        if _whisper_instance is None:
+            try:
+                import whisper as _whisper_mod
+                print(f"[Whisper] Loading '{_WHISPER_MODEL}' model…")
+                _whisper_instance = _whisper_mod.load_model(_WHISPER_MODEL)
+                print("[Whisper] Model ready.")
+            except ImportError:
+                print("[Whisper] openai-whisper not installed.")
+                _whisper_instance = None
+    return _whisper_instance
+
+# ── Gemma system prompt + mode parsing ──────────────────────────
 _GEMMA_SYSTEM = (
     "You are an intelligent interpreter for a deaf-blind braille reader. "
     "You receive camera images from their environment. "
-    "Distill the most important information into AT MOST 5 words. "
-    "Output ONLY the phrase — no explanation, no punctuation except spaces, lowercase only. "
-    "If nothing meaningful is visible, output: nothing detected"
+    "Choose exactly ONE mode tag based on what you see, then give a short phrase:\n"
+    "  [TEXT] — if text, signs, labels, or written words are visible: extract the text\n"
+    "  [SCENE] — if it is an environment or scene with no prominent text: describe in 5 words or fewer\n"
+    "  [PERSON] — if a person is the main subject: describe them in 5 words or fewer\n"
+    "Output format: [TAG] phrase — lowercase, no punctuation except spaces, AT MOST 5 words after the tag. "
+    "Examples: '[TEXT] stop', '[SCENE] busy street corner', '[PERSON] someone waving'. "
+    "If nothing meaningful is visible, output: [SCENE] nothing detected"
 )
+
+_MODE_DELAYS = {"TEXT": 1.5, "SCENE": 0.8, "PERSON": 1.2}
+
+def _parse_gemma_output(raw: str):
+    """Return (mode, clean_text, delay) from Gemma's tagged output."""
+    text = raw.strip().lower()
+    m = re.match(r'^\[(text|scene|person)\]\s*', text)
+    if m:
+        mode = m.group(1).upper()
+        clean = text[m.end():].strip().rstrip(".,!?;:\"'")
+    else:
+        mode = "SCENE"
+        clean = text.rstrip(".,!?;:\"'").strip()
+    return mode, clean, _MODE_DELAYS.get(mode, 1.5)
 
 @app.route("/api/snap", methods=["POST"])
 def snap():
@@ -306,9 +352,87 @@ def snap():
     return jsonify({"ok": True, "thumbnail": thumbnail})
 
 
+@app.route("/api/gemma-stream", methods=["POST"])
+def gemma_stream():
+    """
+    Streaming SSE endpoint combining Features 1-3, 5, and 6.
+    Accepts optional JSON body: { audio_transcript: "..." }
+    Yields SSE tokens as they arrive from Ollama, then a final done event
+    with mode (TEXT/SCENE/PERSON), clean text, and suggested pacing delay.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    audio_transcript = (body.get("audio_transcript") or "").strip()
+
+    with _last_snap_lock:
+        snap_bytes = _last_snap
+    if snap_bytes is None:
+        def _err():
+            yield "data: " + json.dumps({"error": "No frame snapped yet — call /api/snap first"}) + "\n\n"
+        return Response(stream_with_context(_err()), mimetype="text/event-stream")
+
+    image_b64 = base64.b64encode(snap_bytes).decode()
+
+    with _frame_history_lock:
+        history_list = list(_frame_history)
+
+    history_prefix = ""
+    if history_list:
+        prev_str = ", ".join(f"'{h}'" for h in history_list)
+        history_prefix = f"Previously seen: {prev_str}. Now: "
+
+    if audio_transcript:
+        user_content = (
+            f"{history_prefix}Someone nearby said: \"{audio_transcript}\". "
+            "What is the single most important information combining audio and image? "
+            "Reply with [TEXT], [SCENE], or [PERSON] tag followed by 5 words or fewer."
+        )
+    else:
+        user_content = (
+            f"{history_prefix}What is the most important information in this image? "
+            "Reply with [TEXT], [SCENE], or [PERSON] tag followed by 5 words or fewer."
+        )
+
+    def _generate():
+        import ollama
+        full_text = ""
+        try:
+            stream = ollama.chat(
+                model="gemma4:e4b",
+                messages=[
+                    {"role": "system", "content": _GEMMA_SYSTEM},
+                    {"role": "user", "content": user_content, "images": [image_b64]},
+                ],
+                stream=True,
+                options={"temperature": 0.1, "num_predict": 30},
+            )
+            for chunk in stream:
+                token = chunk["message"]["content"]
+                full_text += token
+                yield "data: " + json.dumps({"token": token}) + "\n\n"
+
+            mode, clean_text, delay = _parse_gemma_output(full_text)
+            with _frame_history_lock:
+                _frame_history.append(clean_text)
+
+            yield "data: " + json.dumps({
+                "done": True,
+                "text": clean_text,
+                "mode": mode,
+                "delay": delay,
+            }) + "\n\n"
+        except Exception as exc:
+            yield "data: " + json.dumps({"error": str(exc)}) + "\n\n"
+
+    return Response(
+        stream_with_context(_generate()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.route("/api/gemma-process", methods=["POST"])
 def gemma_process():
-    """Step 2: run Gemma 4 on the last snapped frame. Takes 10-40s."""
+    """Step 2 fallback: run Gemma 4 on the last snapped frame (non-streaming). Takes 10-40s."""
     with _last_snap_lock:
         snap_bytes = _last_snap
     if snap_bytes is None:
@@ -322,14 +446,16 @@ def gemma_process():
                 {"role": "system", "content": _GEMMA_SYSTEM},
                 {
                     "role": "user",
-                    "content": "What is the most important information in this image? 5 words or fewer.",
+                    "content": "What is the most important information in this image? Reply with [TEXT], [SCENE], or [PERSON] tag followed by 5 words or fewer.",
                     "images": [image_b64],
                 },
             ],
             options={"temperature": 0.1, "num_predict": 30},
         )
-        text = resp["message"]["content"].strip().lower().rstrip(".,!?;:\"'").strip()
-        return jsonify({"text": text})
+        mode, clean_text, delay = _parse_gemma_output(resp["message"]["content"])
+        with _frame_history_lock:
+            _frame_history.append(clean_text)
+        return jsonify({"text": clean_text, "mode": mode, "delay": delay})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
@@ -360,6 +486,42 @@ def gemma_capture():
         return jsonify({"text": text})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/transcribe", methods=["POST"])
+def transcribe_audio():
+    """
+    Accepts multipart/form-data with field 'audio' (webm/ogg blob from MediaRecorder).
+    Runs Whisper locally and returns { transcript: "..." }.
+    Requires ffmpeg in PATH for webm decoding.
+    """
+    import tempfile
+
+    if "audio" not in request.files:
+        return jsonify({"error": "No audio file in request"}), 400
+
+    model = _load_whisper()
+    if model is None:
+        return jsonify({"error": "Whisper not available — install openai-whisper"}), 503
+
+    audio_file = request.files["audio"]
+    suffix = ".webm"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            audio_file.save(tmp.name)
+            tmp_path = tmp.name
+        result = model.transcribe(tmp_path, fp16=False, language="en")
+        transcript = result.get("text", "").strip()
+        return jsonify({"transcript": transcript})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
