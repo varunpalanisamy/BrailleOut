@@ -20,16 +20,22 @@ A physical assistive device that reads real-world text through a webcam, process
 
 ## How It Works
 
+**Cloud pipeline (Gemini + Claude):**
 ```
 Webcam → Gemini Vision OCR → Claude AI Cleanup → Braille Cell UI → Arduino → 6 Servo Motors → TTS Voice
 ```
 
+**Local pipeline (Gemma via Ollama — no API keys needed):**
+```
+Webcam + Microphone → Whisper STT → Gemma 4 (Ollama, offline) → Braille Cell UI → Arduino → TTS Voice
+```
+
 1. **Webcam** captures a live image of text (a book, sign, screen, etc.)
-2. **Google Gemini 2.5 Flash** performs OCR — extracting raw text from the image
-3. **Anthropic Claude** cleans up OCR errors, fixes spelling, removes gibberish
+2. **Google Gemini 2.5 Flash** (or **Gemma 4 locally via Ollama**) performs OCR — extracting raw text from the image
+3. **Anthropic Claude** cleans up OCR errors in the cloud pipeline; Gemma handles everything locally in the offline pipeline
 4. **Braille converter** maps each letter to its Grade 1 Braille dot pattern
 5. **tkinter UI** displays the Braille cell visually — 6 dots in a 2×3 grid
-6. **Arduino** receives a 6-character binary string (e.g. `"101010"`) over serial and moves 6 servo motors to physically raise or lower Braille pins
+6. **Arduino** receives a 6-character binary string (e.g. `"101010"`) over serial and moves 6 servo motors to physically raise or lower Braille pins *(optional — see below)*
 7. **Text-to-speech** announces each letter aloud (ElevenLabs → pyttsx3 → macOS `say` fallback)
 
 ---
@@ -39,9 +45,25 @@ Webcam → Gemini Vision OCR → Claude AI Cleanup → Braille Cell UI → Ardui
 | File | Description |
 |------|-------------|
 | `braille_pipeline.py` | Main app — full end-to-end pipeline with live camera, OCR, Claude, Braille display, Arduino, and TTS |
+| `gemma_pipeline.py` | Offline pipeline — uses local Gemma 4 via Ollama (no API keys); supports voice input via Whisper + webcam vision |
+| `api_server.py` | Flask backend for the web frontend — streams Gemma vision analysis via Server-Sent Events |
 | `braille_servo_test.py` | Standalone servo tester — press a letter key to instantly test the Braille cell UI and servo movement without needing the AI pipeline |
-| `braille_display.py` | Minimal Braille cell viewer — press a–z to see the dot pattern, no hardware required |
+| `braille_display.py` | Minimal Braille cell viewer — press a–z to see the dot pattern, **no hardware or API keys required** |
 | `requirements.txt` | All Python dependencies |
+
+---
+
+## No Hardware? No Problem
+
+**You do not need an Arduino or servo motors to run this project.** The hardware is what makes it a physical assistive device, but every pipeline still displays Braille on-screen in a visual UI — so you can fully explore and demo the project as a software prototype with zero physical components.
+
+| Mode | What you need | What you see |
+|------|--------------|--------------|
+| `braille_display.py` | Nothing — no keys, no hardware | Braille dot patterns for any letter you press |
+| `gemma_pipeline.py` | Ollama + Gemma model (offline, free) | Live Braille cell UI driven by your webcam and voice |
+| `braille_pipeline.py` | API keys (Gemini + Anthropic) | Full pipeline UI — Braille cell updates after each capture |
+
+If no Arduino is connected, the serial output step is simply skipped — everything else (OCR, AI, Braille cell display, TTS) runs exactly the same. **The Braille cell will still light up on screen for every letter.**
 
 ---
 
@@ -62,7 +84,7 @@ source myenv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Add your API keys
+### 3. Add your API keys *(cloud pipeline only — skip if using Gemma)*
 
 Create a `.env` file in the project root (never commit this):
 
@@ -77,7 +99,25 @@ Get keys from:
 - **Google Gemini**: [aistudio.google.com](https://aistudio.google.com)
 - **ElevenLabs**: [elevenlabs.io](https://elevenlabs.io) *(optional)*
 
-### 4. Set up the Arduino
+### 4. Set up Ollama + Gemma *(offline pipeline only — skip if using cloud APIs)*
+
+The `gemma_pipeline.py` runs entirely offline using a local model. No API keys are needed.
+
+```bash
+# Install Ollama
+brew install ollama          # macOS
+# Windows / Linux: download from https://ollama.com
+
+# Start the Ollama daemon (keep this running in the background)
+ollama serve
+
+# Pull the Gemma 4 model — one-time ~3 GB download, runs offline after
+ollama pull gemma4:e4b
+```
+
+Once pulled, the model is cached locally and works without an internet connection.
+
+### 5. Set up the Arduino *(optional — skip if running as a software prototype)*
 
 1. Install [Arduino IDE](https://www.arduino.cc/en/software)
 2. Wire 6 servos to digital pins 2–7
@@ -153,6 +193,20 @@ python3 braille_pipeline.py
 4. Use **NEXT →** / **← PREV** (or SPACE / arrow keys) to step through each letter
 5. The Braille cell lights up on screen, the servos move physically, and the letter is spoken aloud
 
+### Offline pipeline — Gemma via Ollama (no API keys, no internet)
+
+> **Requires**: Ollama running (`ollama serve`) with `gemma4:e4b` pulled — see Setup step 4.
+
+```bash
+python3 gemma_pipeline.py
+```
+
+1. A Tkinter window opens with a live webcam feed and Braille cell display
+2. Speak a word or point the camera at text — Whisper transcribes audio locally
+3. Gemma 4 processes the image and/or transcript entirely on your machine
+4. The Braille cell updates on screen for each letter; servos move if an Arduino is connected
+5. No API keys or internet connection needed after the one-time model pull
+
 ### Servo tester (no AI needed)
 
 ```bash
@@ -188,7 +242,9 @@ Example: letter **K** (dots 1, 3) → `"101000"` → servo 1 and servo 3 raise u
 
 | Component | Technology |
 |-----------|-----------|
-| OCR | Google Gemini 2.5 Flash (Vision) |
+| OCR (cloud) | Google Gemini 2.5 Flash (Vision) |
+| OCR (offline) | Gemma 4 via Ollama (`gemma4:e4b`) |
+| Speech-to-text (offline) | OpenAI Whisper (local) |
 | Text cleanup | Anthropic Claude Sonnet 4.6 |
 | UI | Python tkinter + Pillow |
 | Camera | OpenCV |
