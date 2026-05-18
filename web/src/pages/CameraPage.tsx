@@ -4,50 +4,76 @@ import { useWebcam } from '../hooks/useWebcam';
 import { useLetterNav } from '../hooks/useLetterNav';
 import { parseSentenceToLetters } from '../data/braille';
 
-interface CameraOption {
-  index: number;
-  label: string;
+interface CameraOption { index: number; label: string; }
+
+interface QueueItem {
+  id: string;
+  thumbnail: string;
+  status: 'processing' | 'done' | 'error';
+  streamingText: string;
+  text: string;
+  mode: string;
+  letters: string[];
 }
 
-type ScanPhase = 'idle' | 'snapping' | 'processing' | 'done' | 'error';
-type MicPhase = 'idle' | 'recording' | 'transcribing' | 'done';
+const MAX_QUEUE = 5;
+const MAX_CONCURRENT = 2;
+const SNAP_INTERVAL_MS = 5000;
+const BACKEND = 'http://localhost:5001';
+
+const FALLBACK_PHRASES = new Set(['text visible', 'scene ahead', 'person present', 'nothing detected']);
+
+function isSimilar(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  if (FALLBACK_PHRASES.has(a) && FALLBACK_PHRASES.has(b)) return a === b;
+  if (FALLBACK_PHRASES.has(a) || FALLBACK_PHRASES.has(b)) return false;
+  const wa = new Set(a.toLowerCase().split(/\s+/).filter(Boolean));
+  const wb = new Set(b.toLowerCase().split(/\s+/).filter(Boolean));
+  if (wa.size === 0 || wb.size === 0) return false;
+  const intersection = [...wa].filter(w => wb.has(w)).length;
+  const jaccard = intersection / new Set([...wa, ...wb]).size;
+  const subsetRatio = Math.max(intersection / wa.size, intersection / wb.size);
+  return (jaccard >= 0.65 || (subsetRatio >= 0.8 && Math.min(wa.size, wb.size) >= 2))
+    && intersection >= 2;
+}
 
 export function CameraPage() {
   const { streamUrl } = useWebcam();
+  const [queue, setQueue] = useState<QueueItem[]>([]);
   const [letters, setLetters] = useState<string[]>([]);
-  const [ocrText, setOcrText] = useState('');
-  const [processing, setProcessing] = useState(false);
-  const [apiError, setApiError] = useState('');
+  const [isLive, setIsLive] = useState(false);
   const [streamError, setStreamError] = useState(false);
   const [streamKey, setStreamKey] = useState(0);
-  const [isLive, setIsLive] = useState(false);
-  const [scanPhase, setScanPhase] = useState<ScanPhase>('idle');
-  const [thumbnail, setThumbnail] = useState<string>('');
-  const [streamingTokens, setStreamingTokens] = useState('');
-  const [gemmaMode, setGemmaMode] = useState<string>('');
-  const [suggestedDelay, setSuggestedDelay] = useState<number | undefined>(undefined);
-  const lastTextRef = useRef('');
-
-  // Microphone state
-  const [micPhase, setMicPhase] = useState<MicPhase>('idle');
-  const [audioTranscript, setAudioTranscript] = useState('');
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
-  const autoStopRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
   const [cameras, setCameras] = useState<CameraOption[]>([]);
   const [activeCamera, setActiveCamera] = useState<number | null>(null);
   const [switching, setSwitching] = useState(false);
+  const [suggestedDelay, setSuggestedDelay] = useState<number | undefined>(undefined);
+
+  const queueRef = useRef<QueueItem[]>([]);
+  queueRef.current = queue;
 
   const nav = useLetterNav(letters, suggestedDelay);
+
+  // Auto-retry stream every 3s when in error state
+  useEffect(() => {
+    if (!streamError) return;
+    const id = setInterval(() => {
+      setStreamError(false);
+      setStreamKey(k => k + 1);
+    }, 3000);
+    return () => clearInterval(id);
+  }, [streamError]);
+
+  // Keep auto-advance running as new letters arrive
+  useEffect(() => {
+    if (isLive && letters.length > 0 && !nav.isAuto) nav.startAuto();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [letters.length, isLive]);
 
   useEffect(() => {
     fetch('/api/cameras')
       .then(r => r.json())
-      .then(data => {
-        setCameras(data.cameras ?? []);
-        setActiveCamera(data.active ?? null);
-      })
+      .then(d => { setCameras(d.cameras ?? []); setActiveCamera(d.active ?? null); })
       .catch(() => {});
   }, []);
 
@@ -55,69 +81,37 @@ export function CameraPage() {
     if (index === activeCamera || switching) return;
     setSwitching(true);
     try {
-      const res = await fetch('/api/set-camera', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+      const d = await fetch('/api/set-camera', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ index }),
-      });
-      const data = await res.json();
-      if (data.ok) {
-        setActiveCamera(data.active);
-        setStreamError(false);
-        setStreamKey(k => k + 1);
-      }
-    } catch {
-      // backend not running
-    } finally {
-      setSwitching(false);
-    }
+      }).then(r => r.json());
+      if (d.ok) { setActiveCamera(d.active); setStreamError(false); setStreamKey(k => k + 1); }
+    } catch { /* backend offline */ } finally { setSwitching(false); }
   };
 
-  const captureOnce = useCallback(async (audioTranscriptOverride?: string) => {
-    if (processing) return;
-    setProcessing(true);
-    setApiError('');
-    setStreamingTokens('');
-    setGemmaMode('');
-
+  // ── Process one queue item via SSE ──────────────────────────────
+  const processItem = useCallback(async (id: string, imageb64: string) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60000);
     try {
-      // Step 1: grab frame instantly
-      setScanPhase('snapping');
-      const snapRes = await fetch('/api/snap', { method: 'POST' });
-      const snapData = await snapRes.json();
-      if (snapData.error) throw new Error(snapData.error);
-      setThumbnail(snapData.thumbnail);
-
-      // Frame captured — user can put the sign down
-      setScanPhase('processing');
-
-      // Step 2: stream Gemma inference via SSE
-      const txToUse = audioTranscriptOverride ?? audioTranscript;
-      const body: Record<string, string> = {};
-      if (txToUse) body.audio_transcript = txToUse;
-
-      const gemmaRes = await fetch('/api/gemma-stream', {
+      const res = await fetch(`${BACKEND}/api/gemma-stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ image_b64: imageb64 }),
+        signal: controller.signal,
       });
+      if (!res.body) throw new Error('no body');
 
-      if (!gemmaRes.body) throw new Error('No response body from /api/gemma-stream');
-
-      const reader = gemmaRes.body.getReader();
+      const reader = res.body.getReader();
       const decoder = new TextDecoder();
-      let sseBuffer = '';
-      let finalText = '';
-      let finalMode = 'SCENE';
-      let finalDelay: number | undefined = undefined;
+      let buf = '';
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        sseBuffer += decoder.decode(value, { stream: true });
-
-        const lines = sseBuffer.split('\n');
-        sseBuffer = lines.pop() ?? '';
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop() ?? '';
 
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue;
@@ -125,258 +119,189 @@ export function CameraPage() {
           if (!payload) continue;
           try {
             const evt = JSON.parse(payload);
-            if (evt.error) throw new Error(evt.error);
+            if (evt.token !== undefined) {
+              setQueue(prev => prev.map(item =>
+                item.id === id ? { ...item, streamingText: item.streamingText + evt.token } : item
+              ));
+            }
             if (evt.done) {
-              finalText = evt.text ?? '';
-              finalMode = evt.mode ?? 'SCENE';
-              finalDelay = evt.delay ?? undefined;
-            } else if (evt.token !== undefined) {
-              setStreamingTokens(prev => prev + evt.token);
+              if (evt.delay !== undefined) setSuggestedDelay(evt.delay);
+              const newText: string = evt.text ?? '';
+              const parsedLetters = parseSentenceToLetters(newText);
+
+              if (FALLBACK_PHRASES.has(newText)) {
+                setQueue(prev => prev.filter(i => i.id !== id));
+                return;
+              }
+
+              const currentQueue = queueRef.current;
+              const prevDone = currentQueue.filter(i => i.status === 'done' && i.id !== id);
+              const lastDone = prevDone[prevDone.length - 1];
+              const isDuplicate = !!(lastDone && isSimilar(lastDone.text, newText));
+
+              if (isDuplicate) {
+                setQueue(prev => prev.filter(i => i.id !== id));
+              } else {
+                setQueue(prev => prev.map(item =>
+                  item.id === id
+                    ? { ...item, status: 'done', text: newText, mode: evt.mode ?? '', letters: parsedLetters, streamingText: '' }
+                    : item
+                ));
+                setLetters(l => [...l, ...parsedLetters]);
+              }
             }
-          } catch (parseErr) {
-            if (parseErr instanceof Error && parseErr.message !== 'Unexpected end of JSON input') {
-              throw parseErr;
-            }
-          }
+          } catch { /* ignore malformed SSE */ }
         }
       }
-
-      setOcrText(finalText);
-      setGemmaMode(finalMode);
-      if (finalDelay !== undefined) setSuggestedDelay(finalDelay);
-      setScanPhase('done');
-
-      if (finalText !== lastTextRef.current) {
-        lastTextRef.current = finalText;
-        const parsed = parseSentenceToLetters(finalText);
-        setLetters(parsed.length ? parsed : []);
-      }
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setApiError(msg.includes('fetch') ? 'Backend not running — start api_server.py' : msg);
-      setScanPhase('error');
+      if (e instanceof Error && e.name === 'AbortError') {
+        setQueue(prev => prev.filter(i => i.id !== id));
+      } else {
+        setQueue(prev => prev.map(item =>
+          item.id === id ? { ...item, status: 'error', streamingText: '' } : item
+        ));
+      }
     } finally {
-      setProcessing(false);
+      clearTimeout(timeout);
     }
-  }, [processing, audioTranscript]);
+  }, []);
 
-  // Auto-capture loop: fires immediately then every 8s while Live is on
+  // ── Snap one frame, add to queue, fire Gemma in background ──────
+  const snapAndQueue = useCallback(async () => {
+    const inFlight = queueRef.current.filter(i => i.status === 'processing').length;
+    if (inFlight >= MAX_CONCURRENT) return;
+    let thumbnail = '';
+    try {
+      const d = await fetch('/api/snap', { method: 'POST' }).then(r => r.json());
+      if (!d.thumbnail) return;
+      thumbnail = d.thumbnail;
+    } catch { return; }
+
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    setQueue(prev => [
+      ...prev,
+      { id, thumbnail, status: 'processing', streamingText: '', text: '', mode: '', letters: [] },
+    ].slice(-MAX_QUEUE));
+
+    processItem(id, thumbnail);
+  }, [processItem]);
+
+  // ── Live mode ────────────────────────────────────────────────────
   useEffect(() => {
     if (!isLive) return;
-    captureOnce();
-    const id = setInterval(captureOnce, 8000);
-    return () => clearInterval(id);
+    snapAndQueue();
+    const snapId = setInterval(snapAndQueue, SNAP_INTERVAL_MS);
+    return () => clearInterval(snapId);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLive]);
 
-  // When Live mode loads new letters, start Braille auto-advance immediately
-  useEffect(() => {
-    if (isLive && letters.length > 1) {
-      nav.startAuto();
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [letters]);
+  const stopLive = () => {
+    setIsLive(false);
+    setQueue([]);
+    setLetters([]);
+    nav.stopAuto();
+  };
 
-  // ── Microphone handlers ────────────────────────────────────────
-  const startMicRecording = useCallback(async () => {
-    if (micPhase !== 'idle' || processing) return;
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '';
-      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-      audioChunksRef.current = [];
-
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) audioChunksRef.current.push(e.data);
-      };
-
-      recorder.onstop = async () => {
-        stream.getTracks().forEach(t => t.stop());
-        if (autoStopRef.current) {
-          clearTimeout(autoStopRef.current);
-          autoStopRef.current = null;
-        }
-        setMicPhase('transcribing');
-        const blob = new Blob(audioChunksRef.current, { type: mimeType || 'audio/webm' });
-        const formData = new FormData();
-        formData.append('audio', blob, 'recording.webm');
-        try {
-          const res = await fetch('/api/transcribe', { method: 'POST', body: formData });
-          const data = await res.json();
-          const tx: string = data.transcript ?? '';
-          setAudioTranscript(tx);
-          setMicPhase('done');
-          await captureOnce(tx);
-        } catch {
-          setMicPhase('idle');
-        }
-      };
-
-      mediaRecorderRef.current = recorder;
-      recorder.start();
-      setMicPhase('recording');
-
-      // Auto-stop after 5 seconds
-      autoStopRef.current = setTimeout(() => {
-        if (mediaRecorderRef.current?.state === 'recording') {
-          mediaRecorderRef.current.stop();
-        }
-      }, 5000);
-    } catch {
-      setMicPhase('idle');
-    }
-  }, [micPhase, processing, captureOnce]);
-
-  const stopMicRecording = useCallback(() => {
-    if (mediaRecorderRef.current?.state === 'recording') {
-      mediaRecorderRef.current.stop();
-    }
-  }, []);
-
-  const resetMic = useCallback(() => {
-    setMicPhase('idle');
-    setAudioTranscript('');
-  }, []);
+  const processingCount = queue.filter(i => i.status === 'processing').length;
+  const doneCount = queue.filter(i => i.status === 'done').length;
 
   return (
     <div className="page-two-col">
       <div className="page-main">
-        <div className="section-header">
-          <div className="section-title">Camera → Braille</div>
-          <div className="section-sub">Toggle Live, point the webcam at text, and watch it load into the Braille display automatically.</div>
-        </div>
 
-        {/* Camera selector */}
-        {cameras.length > 0 && (
-          <div className="camera-selector">
-            <span className="camera-selector-label">Camera</span>
-            <div className="camera-selector-btns">
-              {cameras.map(cam => (
-                <button
-                  key={cam.index}
-                  className={`camera-sel-btn${cam.index === activeCamera ? ' active' : ''}`}
-                  onClick={() => switchCamera(cam.index)}
-                  disabled={switching}
-                >
-                  {cam.label}
-                </button>
-              ))}
+        <div className="camera-panel">
+          <div className="section-header">
+            <div className="section-title">Camera → Braille</div>
+            <div className="section-sub">
+              Live mode snaps every {SNAP_INTERVAL_MS / 1000}s — duplicate scenes are discarded automatically.
             </div>
           </div>
-        )}
 
-        {/* External webcam stream from Flask backend */}
-        <div className="camera-wrap">
-          {!streamError ? (
-            <img
-              key={streamKey}
-              src={streamUrl}
-              alt="Webcam feed"
-              style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-              onError={() => setStreamError(true)}
-            />
-          ) : (
-            <div className="camera-overlay">
-              <span style={{ fontSize: 28 }}>⚠</span>
-              <span className="camera-overlay-text" style={{ color: 'var(--error)' }}>
-                Cannot reach webcam stream — make sure api_server.py is running
-              </span>
+          {cameras.length > 0 && (
+            <div className="camera-selector">
+              <span className="camera-selector-label">Camera</span>
+              <div className="camera-selector-btns">
+                {cameras.map(cam => (
+                  <button key={cam.index}
+                    className={`camera-sel-btn${cam.index === activeCamera ? ' active' : ''}`}
+                    onClick={() => switchCamera(cam.index)} disabled={switching}
+                  >{cam.label}</button>
+                ))}
+              </div>
             </div>
           )}
 
-          {!streamError && (
-            <div className="camera-badge">
-              <div className={`live-dot${isLive ? '' : ' inactive'}`} />
-              {isLive ? 'SCANNING' : 'LIVE'}
+          <div className="camera-wrap">
+            {!streamError ? (
+              <img key={streamKey} src={streamUrl} alt="Webcam feed"
+                style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                onError={() => setStreamError(true)} />
+            ) : (
+              <div className="camera-overlay">
+                <span style={{ fontSize: 28 }}>⚠</span>
+                <span className="camera-overlay-text" style={{ color: 'var(--error)' }}>
+                  Cannot reach webcam stream — make sure api_server.py is running
+                </span>
+              </div>
+            )}
+            {!streamError && (
+              <div className="camera-badge">
+                <div className={`live-dot${isLive ? '' : ' inactive'}`} />
+                {isLive
+                  ? `SCANNING${processingCount > 0 ? ` · ${processingCount} pending` : ''}`
+                  : 'LIVE'}
+              </div>
+            )}
+            <div className="camera-corners">
+              <span className="tl" /><span className="tr" />
+              <span className="bl" /><span className="br" />
             </div>
-          )}
-
-          <div className="camera-corners">
-            <span className="tl" /><span className="tr" />
-            <span className="bl" /><span className="br" />
           </div>
-        </div>
 
-        {/* Controls row: Live toggle + mic button */}
-        <div className="camera-controls-row">
           <button
             className={`capture-btn${isLive ? ' active' : ''}`}
-            onClick={() => setIsLive(v => !v)}
+            onClick={() => isLive ? stopLive() : setIsLive(true)}
             disabled={streamError}
+            style={{ width: '100%' }}
           >
-            {isLive ? '⏹ Stop Live' : '▶ Live'}
-          </button>
-
-          <button
-            className={`mic-btn${micPhase === 'recording' ? ' recording' : ''}`}
-            onMouseDown={startMicRecording}
-            onMouseUp={stopMicRecording}
-            onTouchStart={startMicRecording}
-            onTouchEnd={stopMicRecording}
-            disabled={processing && micPhase === 'idle'}
-            title="Hold to record audio — Gemma will combine speech with camera"
-          >
-            {micPhase === 'idle' && 'Hold to Speak'}
-            {micPhase === 'recording' && 'Recording…'}
-            {micPhase === 'transcribing' && 'Transcribing…'}
-            {micPhase === 'done' && 'Heard it'}
+            {isLive ? '⏹ Stop' : '▶ Live'}
           </button>
         </div>
 
-        {/* Audio transcript display */}
-        {micPhase === 'done' && audioTranscript && (
-          <div className="transcript-result">
-            <span className="ocr-label">Heard →</span>
-            <span>{audioTranscript}</span>
-            <button className="transcript-clear" onClick={resetMic} title="Clear transcript">✕</button>
-          </div>
-        )}
-
-        {/* Status banner */}
-        {isLive && (
-          <div className="scan-status-banner" data-phase={scanPhase}>
-            {scanPhase === 'idle' && (
-              <span>Hold text up to camera — scanning starts automatically.</span>
-            )}
-            {scanPhase === 'snapping' && (
-              <span>📸 Capturing frame…</span>
-            )}
-            {scanPhase === 'processing' && (
-              <>
-                <span className="scan-spinner" />
-                <span>
-                  <strong>Frame captured — you can put the sign down.</strong>
-                  <br />Gemma 4 is analyzing…
-                  {streamingTokens && (
-                    <span className="streaming-preview"> {streamingTokens}</span>
-                  )}
-                </span>
-                {thumbnail && (
-                  <img
-                    src={`data:image/jpeg;base64,${thumbnail}`}
-                    alt="Captured frame"
-                    className="scan-thumbnail"
-                  />
-                )}
-              </>
-            )}
-            {scanPhase === 'done' && (
-              <span>Done — next scan in a few seconds.</span>
-            )}
-            {scanPhase === 'error' && (
-              <span style={{ color: 'var(--error)' }}>⚠ {apiError}</span>
-            )}
-          </div>
-        )}
-
-        {/* Gemma result with mode badge */}
-        {ocrText && (
-          <div className="ocr-result">
-            <span className="ocr-label">Gemma 4 →</span>
-            {gemmaMode && (
-              <span className={`ocr-mode-tag mode-${gemmaMode.toLowerCase()}`}>[{gemmaMode}]</span>
-            )}
-            <span>{ocrText}</span>
+        {queue.length > 0 && (
+          <div className="gemma-queue">
+            <div className="gemma-queue-header">
+              <span className="gemma-queue-title">Analysis Queue</span>
+              {doneCount > 0 && (
+                <span className="gemma-queue-stats">{doneCount} done{processingCount > 0 ? ` · ${processingCount} pending` : ''}</span>
+              )}
+            </div>
+            <div className="gemma-queue-list">
+              {[...queue].reverse().map(item => (
+                <div key={item.id} className={`gemma-queue-card status-${item.status}`}>
+                  <img src={`data:image/jpeg;base64,${item.thumbnail}`} alt="" className="gemma-queue-thumb" />
+                  <div className="gemma-queue-body">
+                    {item.status === 'processing' && (
+                      <div className="gemma-queue-pending">
+                        <span className="scan-spinner" style={{ width: 14, height: 14, borderWidth: 2 }} />
+                        <span className="gemma-queue-streaming">
+                          {item.streamingText || 'Analyzing…'}
+                        </span>
+                      </div>
+                    )}
+                    {item.status === 'done' && (
+                      <>
+                        <div className="gemma-queue-meta">
+                          {item.mode && <span className={`ocr-mode-tag mode-${item.mode.toLowerCase()}`}>{item.mode}</span>}
+                        </div>
+                        <div className="gemma-queue-text">{item.text}</div>
+                      </>
+                    )}
+                    {item.status === 'error' && <span className="gemma-queue-error">Analysis failed</span>}
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
         )}
       </div>

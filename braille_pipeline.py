@@ -350,7 +350,7 @@ class BraillePipelineApp(tk.Tk):
         delay_row = tk.Frame(self, bg=bg)
         delay_row.pack(pady=(0, 4))
         tk.Label(delay_row, text="Auto delay:", font=("Helvetica", 11), fg="#555", bg=bg).pack(side=tk.LEFT)
-        self._delay_var = tk.DoubleVar(value=1.0)
+        self._delay_var = tk.DoubleVar(value=0.5)
         self._delay_slider = tk.Scale(delay_row, from_=0.3, to=5.0, resolution=0.1,
                                        orient=tk.HORIZONTAL, length=200,
                                        variable=self._delay_var,
