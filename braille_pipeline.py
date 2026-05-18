@@ -147,6 +147,34 @@ def speak_async(text: str) -> None:
 #  OCR + CLEANUP
 # ============================================================
 
+def ocr_with_gemma(frame) -> str:
+    """Primary OCR path: single local Gemma call replaces Gemini + Claude chain."""
+    print("[Step 2-Gemma] Encoding frame and calling Gemma for OCR…")
+    try:
+        import ollama
+        import base64 as _b64
+        _, buf = cv2.imencode(".jpg", frame)
+        image_b64 = _b64.b64encode(buf.tobytes()).decode()
+        t0 = time.time()
+        resp = ollama.chat(
+            model="gemma4:e4b",
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Extract all text visible in this image. Return only the clean text, no commentary, no markdown.",
+                    "images": [image_b64],
+                }
+            ],
+            options={"temperature": 0.0, "num_predict": 200},
+        )
+        raw = resp["message"]["content"].strip()
+        print(f"[Step 2-Gemma] Gemma OCR in {time.time()-t0:.1f}s → {raw!r}")
+        return raw
+    except Exception as e:
+        print(f"[Step 2-Gemma] ERROR: {e}")
+        return ""
+
+
 def ocr_frame(frame) -> str:
     print("[Step 2] Encoding frame and calling Gemini Vision…")
     _, buf = cv2.imencode(".jpg", frame)
@@ -389,15 +417,19 @@ class BraillePipelineApp(tk.Tk):
         self._processing = True
         self._capture_btn.configure(state=tk.DISABLED, text="Processing…")
         self._auto_btn.configure(state=tk.DISABLED)
-        self._set_status("Sending to Gemini Vision OCR… (this takes a few seconds)")
+        self._set_status("Sending to Gemma OCR… (30-60s, fully offline)")
         threading.Thread(target=self._process, args=(self._last_frame.copy(),), daemon=True).start()
         # Safety: force-unlock after 45s if thread never returns
         self.after(45000, self._unlock_if_stuck)
 
     def _process(self, frame) -> None:
         try:
-            raw = ocr_frame(frame)
-            cleaned = clean_text_with_claude(raw)
+            # Primary: single local Gemma call (free, offline, no API keys)
+            cleaned = ocr_with_gemma(frame)
+            if not cleaned:
+                # Fallback: Gemini OCR → Claude cleanup
+                raw = ocr_frame(frame)
+                cleaned = clean_text_with_claude(raw)
             letters = [ch for ch in cleaned.lower() if ch in BRAILLE]
             self.after(0, self._on_process_done, letters, cleaned)
         except Exception as e:
