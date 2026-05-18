@@ -1,6 +1,8 @@
 # AI-Powered Braille Display
 
-An assistive device that reads real-world text through a webcam and converts it to Grade 1 Braille — displayed visually on screen and physically raised by 6 servo motors. Powered by **Gemma 4**, Google's latest multimodal model, running locally via Ollama with no internet or API keys required.
+An assistive device that reads real-world text through a camera and converts it to Grade 1 Braille — displayed visually on screen and physically raised by 6 servo motors. Powered by **Gemma 4**, Google's latest multimodal model, running locally via Ollama with no internet or API keys required.
+
+> **No external webcam needed.** The current version defaults to your laptop's built-in camera. Any MacBook or laptop with an internal camera works out of the box.
 
 ---
 

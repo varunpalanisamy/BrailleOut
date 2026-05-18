@@ -1,34 +1,13 @@
 import { useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { MiniCell } from '../components/MiniCell';
 import { DOT_POSITION, dotsToBinary, getActiveDots } from '../data/braille';
 
 const DEMO_WORD = 'braille'.split('');
-const VARUN   = 'varun'.split('');
-const SHIVANI = 'shivani'.split('');
 
 // Geometry for the large hero Braille cell
 const DW = 200, DH = 300, DR = 33;
 const DCOLS = [55, 145];
 const DROWS = [55, 150, 245];
-
-function BrailleNameWord({ word }: { word: string[] }) {
-  return (
-    <>
-      {word.map((ch, i) => (
-        <motion.div
-          key={i}
-          className="hero-letter-cell"
-          initial={{ opacity: 0, y: 12, scale: 0.7 }}
-          animate={{ opacity: 1, y: 0, scale: 1 }}
-          transition={{ delay: 0.6 + i * 0.06, type: 'spring', stiffness: 300, damping: 22 }}
-        >
-          <MiniCell activeDots={getActiveDots(ch)} size="sm" />
-        </motion.div>
-      ))}
-    </>
-  );
-}
 
 const TEST_STEPS: { label: string; dots: number[] }[] = [
   { label: 'All servos', dots: [1, 2, 3, 4, 5, 6] },
@@ -206,42 +185,6 @@ export function HomePage() {
           )}
         </motion.div>
 
-        {/* ── Names in Braille ── */}
-        <div className="names-row">
-          <div className="names-braille">
-            <div className="name-group">
-              <div className="name-cells">
-                <BrailleNameWord word={VARUN} />
-              </div>
-              <span className="name-label">Varun</span>
-            </div>
-
-            <motion.span
-              className="names-divider"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              transition={{ delay: 0.9 }}
-            >
-              &amp;
-            </motion.span>
-
-            <div className="name-group">
-              <div className="name-cells">
-                <BrailleNameWord word={SHIVANI} />
-              </div>
-              <span className="name-label">Shivani</span>
-            </div>
-          </div>
-
-          <motion.span
-            className="hackdavis-badge"
-            initial={{ opacity: 0, scale: 0.85 }}
-            animate={{ opacity: 1, scale: 1 }}
-            transition={{ delay: 1.1, type: 'spring', stiffness: 260, damping: 20 }}
-          >
-            HackDavis 2026
-          </motion.span>
-        </div>
 
       </div>
     </div>
